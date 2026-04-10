@@ -74,8 +74,8 @@ STRATEGY_RULES: tuple[StrategyRule, ...] = (
         side="yes",
         min_tte_minutes=0.0,
         max_tte_minutes=10.0,
-        min_price_cents=45,
-        max_price_cents=58,
+        min_price_cents=38,
+        max_price_cents=62,
         max_spread_cents=6,
     ),
     StrategyRule(
@@ -83,8 +83,8 @@ STRATEGY_RULES: tuple[StrategyRule, ...] = (
         side="no",
         min_tte_minutes=0.0,
         max_tte_minutes=10.0,
-        min_price_cents=45,
-        max_price_cents=58,
+        min_price_cents=38,
+        max_price_cents=62,
         max_spread_cents=6,
     ),
     StrategyRule(
@@ -92,8 +92,8 @@ STRATEGY_RULES: tuple[StrategyRule, ...] = (
         side="yes",
         min_tte_minutes=0.0,
         max_tte_minutes=10.0,
-        min_price_cents=45,
-        max_price_cents=58,
+        min_price_cents=38,
+        max_price_cents=62,
         max_spread_cents=8,
     ),
     StrategyRule(
@@ -101,14 +101,14 @@ STRATEGY_RULES: tuple[StrategyRule, ...] = (
         side="no",
         min_tte_minutes=0.0,
         max_tte_minutes=10.0,
-        min_price_cents=45,
-        max_price_cents=58,
+        min_price_cents=38,
+        max_price_cents=62,
         max_spread_cents=8,
     ),
 )
 
-SOFT_ENTRY_CAP_CENTS = 55
-HARD_ENTRY_CAP_CENTS = 60
+SOFT_ENTRY_CAP_CENTS = 57
+HARD_ENTRY_CAP_CENTS = 62
 EXPENSIVE_ENTRY_EDGE_PREMIUM = 0.02
 
 
@@ -476,7 +476,30 @@ class LiveTraderConfig:
     exit_cross_cents: int = 4
     execution_session_attempts: int = 3
     execution_session_retry_delay_seconds: float = 0.05
+    execution_ladder_steps_cents: tuple[int, ...] | None = None
+    execution_ladder_steps_cents_high: tuple[int, ...] | None = None
+    high_conviction_edge_threshold: float = 0.0
+    high_conviction_distance_threshold_dollars: float = 0.0
+    enforce_positive_edge_on_execution: bool = False
+    execution_min_edge_margin_low: float = 0.0
+    execution_min_edge_margin_high: float = 0.0
     execution_session_use_rest_fallback: bool = True
+    execution_spread_tight_cents: int = 2
+    execution_spread_wide_cents: int = 6
+    execution_spread_insane_cents: int = 12
+    execution_spread_tight_min_cross_cents: int = 2
+    execution_spread_wide_max_cross_cents: int = 1
+    execution_ladder_delay_high_seconds: float = 5.0
+    execution_ladder_delay_mid_seconds: float = 8.0
+    execution_ladder_delay_low_seconds: float = 12.0
+    fast_market_tte_minutes: float = 5.0
+    fast_market_delay_ceiling_seconds: float = 6.0
+    resting_entry_max_age_seconds: float = 45.0
+    resting_entry_max_age_seconds_high: float = 90.0
+    resting_entry_max_age_seconds_fast: float = 25.0
+    resting_entry_max_age_seconds_low_depth: float = 25.0
+    fast_cancel_tte_minutes: float = 3.0
+    edge_decay_cancel_threshold: float = 0.02
     execution_trace_path: str | None = "data/execution_trace.jsonl"
     execution_heartbeat_seconds: float = 2.0
     event_loop_sleep_seconds: float = 0.1
@@ -493,6 +516,7 @@ class LiveTraderConfig:
     max_ws_quote_age_seconds: float = 10.0
     failed_entry_backoff_seconds: float = 30.0
     failed_entry_backoff_after_attempts: int = 3
+    failed_entry_decay_seconds: float = 15.0
     local_resting_entry_lock_seconds: float = 2.0
     min_orderbook_fill_fraction: float = 0.5
     resting_order_retry_delay_seconds: float = 2.0
@@ -907,6 +931,9 @@ class LiveTrader:
         self.local_resting_entry_locks: dict[str, LocalRestingEntryLock] = {}
         self.failed_entry_attempts: dict[str, int] = {}
         self.failed_entry_blocked_until: dict[str, datetime] = {}
+        self.failed_entry_last_attempt: dict[str, datetime] = {}
+        self.failed_entry_last_price: dict[str, int] = {}
+        self.failed_entry_last_edge: dict[str, float] = {}
         self.closed_trades: list[ClosedTrade] = []
         self.submitted_trade_times: list[datetime] = []
         self.consecutive_losses = 0
@@ -1043,7 +1070,6 @@ class LiveTrader:
         )
         resting_buy_tickers = set(resting_order_tickers) | local_resting_entry_tickers
         open_tickers = local_open_tickers | external_position_tickers | resting_buy_tickers
-        failed_entry_blocked_tickers = self._blocked_failed_entry_tickers(observed_at)
         active_strategy_counts = self._active_strategy_counts()
         available_balance_cents: int | None = None
         try:
@@ -1099,7 +1125,6 @@ class LiveTrader:
             fresh_snapshots,
             blocked_markets=set(external_position_tickers)
             | set(resting_order_tickers)
-            | set(failed_entry_blocked_tickers)
             | permanently_blocked_tickers,
             current_position_contracts=dict(local_position_contracts),
             current_position_strategies=dict(self.position_strategies),
@@ -1148,14 +1173,22 @@ class LiveTrader:
                 )
             )
         candidates = self._apply_reentry_rules(candidates=gbm_filtered, reject_summary=reject_summary)
+        failed_entry_blocked_tickers = self._blocked_failed_entry_tickers(observed_at)
+        backoff_blocked_count = 0
+        execution_candidates: list[StrategyCandidate] = []
+        for candidate in candidates:
+            if candidate.snapshot.market_ticker in failed_entry_blocked_tickers:
+                if not self._allow_backoff_reattempt(candidate):
+                    backoff_blocked_count += 1
+                    continue
+            execution_candidates.append(candidate)
         selection_rejections = summarize_rejections(
             fresh_snapshots,
-            blocked_markets=set(open_tickers) | set(failed_entry_blocked_tickers) | permanently_blocked_tickers,
+            blocked_markets=set(open_tickers) | permanently_blocked_tickers,
             blocked_reason_sets={
                 "has_local_position": local_open_tickers,
                 "has_external_position": set(external_position_tickers),
                 "has_resting_order": resting_buy_tickers,
-                "failed_entry_backoff": set(failed_entry_blocked_tickers),
                 "signal_break_locked": permanently_blocked_tickers,
             },
             active_strategy_counts=dict(active_strategy_counts),
@@ -1168,9 +1201,11 @@ class LiveTrader:
         )
         for reason, count in selection_rejections.items():
             reject_summary[reason] = reject_summary.get(reason, 0) + count
+        if backoff_blocked_count:
+            reject_summary["blocked_by_backoff"] = reject_summary.get("blocked_by_backoff", 0) + backoff_blocked_count
 
         placed: list[dict[str, Any]] = []
-        for candidate in candidates:
+        for candidate in execution_candidates:
             order = self._submit_order(candidate)
             placed.append(order)
             filled_contracts = max(int(order.get("filled_contracts", 0) or 0), 0)
@@ -1189,6 +1224,11 @@ class LiveTrader:
                         "gbm_edge": candidate.gbm_edge,
                         "gbm_probability": candidate.gbm_probability,
                         "observed_at": candidate.snapshot.observed_at,
+                        "fill_edge": (
+                            float(candidate.gbm_probability) - (candidate.price_cents / 100.0)
+                            if candidate.gbm_probability is not None
+                            else None
+                        ),
                     }
                 )
                 existing = self.local_positions.get(candidate.snapshot.market_ticker)
@@ -1219,8 +1259,12 @@ class LiveTrader:
                 self.position_strategies[candidate.snapshot.market_ticker] = candidate.strategy_name
             else:
                 order_status = str(order.get("status") or "")
-                if order_status not in {"resting", "open", "submitted", "pending"}:
-                    self._record_failed_entry_attempt(candidate.snapshot.market_ticker)
+                if self._should_record_failed_entry(order_status=order_status, response=order.get("response")):
+                    self._record_failed_entry_attempt(
+                        candidate.snapshot.market_ticker,
+                        price_cents=candidate.price_cents,
+                        gbm_edge=candidate.gbm_edge,
+                    )
             self.submitted_trade_times.append(observed_at)
 
         return {
@@ -1386,9 +1430,38 @@ class LiveTrader:
             if observed_at >= until:
                 self.failed_entry_blocked_until.pop(ticker, None)
                 self.failed_entry_attempts.pop(ticker, None)
+                self.failed_entry_last_attempt.pop(ticker, None)
+                self.failed_entry_last_price.pop(ticker, None)
+                self.failed_entry_last_edge.pop(ticker, None)
                 continue
             blocked.add(ticker)
         return blocked
+
+    @staticmethod
+    def _should_record_failed_entry(*, order_status: str, response: dict[str, Any] | None) -> bool:
+        status = (order_status or "").strip().lower()
+        if status in {"rejected", "error", "failed"}:
+            return True
+        if response is None:
+            return False
+        if isinstance(response, dict):
+            if response.get("error") or response.get("errors"):
+                return True
+        return False
+
+    def _allow_backoff_reattempt(self, candidate: StrategyCandidate) -> bool:
+        ticker = candidate.snapshot.market_ticker
+        last_price = self.failed_entry_last_price.get(ticker)
+        last_edge = self.failed_entry_last_edge.get(ticker)
+        price_improved = (
+            last_price is not None and candidate.price_cents <= max(last_price - 1, 0)
+        )
+        edge_improved = (
+            last_edge is not None
+            and candidate.gbm_edge is not None
+            and candidate.gbm_edge >= (last_edge + 0.01)
+        )
+        return bool(price_improved or edge_improved)
 
     def _active_local_resting_entry_tickers(
         self,
@@ -1436,23 +1509,48 @@ class LiveTrader:
                 continue
             if snapshot.threshold is None:
                 continue
+            cancel_reason: str | None = None
+            # Time-to-fill cutoff (unless high conviction)
+            age_seconds = (observed_at - lock.created_at).total_seconds()
+            distance = snapshot.spot_price - snapshot.threshold if lock.side == "yes" else snapshot.threshold - snapshot.spot_price
+            is_high_conviction = False
+            if lock.gbm_edge is not None:
+                is_high_conviction = (
+                    lock.gbm_edge >= float(self.config.high_conviction_edge_threshold)
+                    and distance >= float(self.config.high_conviction_distance_threshold_dollars)
+                )
+            max_age = float(self.config.resting_entry_max_age_seconds_high if is_high_conviction else self.config.resting_entry_max_age_seconds)
+            tte_minutes = max((snapshot.expiry - observed_at).total_seconds() / 60.0, 0.0)
+            if tte_minutes <= float(self.config.fast_cancel_tte_minutes):
+                max_age = min(max_age, float(self.config.resting_entry_max_age_seconds_fast))
+                if max_age > 0 and age_seconds > max_age:
+                    cancel_reason = "tte_cutoff_cancel"
+            ask_cents, bid_cents = _side_prices(snapshot, lock.side)
+            if ask_cents is not None and bid_cents is not None:
+                spread_cents = max(ask_cents - bid_cents, 0)
+                if spread_cents >= int(self.config.execution_spread_wide_cents):
+                    max_age = min(max_age, float(self.config.resting_entry_max_age_seconds_low_depth))
+            if cancel_reason is None and max_age > 0 and age_seconds > max_age:
+                cancel_reason = "time_cutoff_cancel"
             dist = self.config.distance_threshold_dollars
             # Signal broken: spot no longer satisfies direction requirement
-            signal_broken = False
-            if lock.side == "yes" and snapshot.spot_price < snapshot.threshold + dist:
-                signal_broken = True
-            elif lock.side == "no" and snapshot.spot_price > snapshot.threshold - dist:
-                signal_broken = True
+            if cancel_reason is None:
+                if lock.side == "yes" and snapshot.spot_price < snapshot.threshold + dist:
+                    cancel_reason = "signal_break_cancel"
+                elif lock.side == "no" and snapshot.spot_price > snapshot.threshold - dist:
+                    cancel_reason = "signal_break_cancel"
             # Also check GBM edge
-            if not signal_broken and volatility is not None:
+            if cancel_reason is None and volatility is not None:
                 ask_cents, _ = _side_prices(snapshot, lock.side)
                 if ask_cents is not None:
                     estimate = self.model.estimate(snapshot, volatility=volatility)
                     side_prob = estimate.probability if lock.side == "yes" else (1.0 - estimate.probability)
                     edge = side_prob - ask_cents / 100.0
                     if edge < self._required_gbm_edge(strategy_name=lock.strategy_name, ask_cents=ask_cents):
-                        signal_broken = True
-            if not signal_broken:
+                        cancel_reason = "signal_break_cancel"
+                    if cancel_reason is None and lock.gbm_edge is not None and edge <= (lock.gbm_edge - float(self.config.edge_decay_cancel_threshold)):
+                        cancel_reason = "edge_decay_cancel"
+            if cancel_reason is None:
                 continue
             # Resolve order_id: fill_feed first, then REST
             order_id: str | None = None
@@ -1471,9 +1569,10 @@ class LiveTrader:
                 try:
                     self.client.cancel_order(order_id)
                     self._trace_execution_event({
-                        "event": "resting_entry_canceled_signal_broke",
+                        "event": "resting_entry_canceled",
                         "market_ticker": ticker,
                         "order_id": order_id,
+                        "reason": cancel_reason,
                     })
                 except Exception:
                     pass
@@ -1481,12 +1580,31 @@ class LiveTrader:
                 self.fill_feed.deregister_order(ticker)
             self.local_resting_entry_locks.pop(ticker, None)
 
-    def _record_failed_entry_attempt(self, ticker: str) -> None:
-        count = self.failed_entry_attempts.get(ticker, 0) + 1
+    def _record_failed_entry_attempt(
+        self,
+        ticker: str,
+        *,
+        price_cents: int | None = None,
+        gbm_edge: float | None = None,
+    ) -> None:
+        now = datetime.now(UTC)
+        count = self.failed_entry_attempts.get(ticker, 0)
+        last_attempt = self.failed_entry_last_attempt.get(ticker)
+        decay_seconds = float(self.config.failed_entry_decay_seconds)
+        if last_attempt is not None and decay_seconds > 0:
+            age = (now - last_attempt).total_seconds()
+            if age >= decay_seconds:
+                count = max(count - 1, 0)
+        count += 1
         self.failed_entry_attempts[ticker] = count
+        self.failed_entry_last_attempt[ticker] = now
+        if price_cents is not None:
+            self.failed_entry_last_price[ticker] = int(price_cents)
+        if gbm_edge is not None:
+            self.failed_entry_last_edge[ticker] = float(gbm_edge)
         threshold = max(int(self.config.failed_entry_backoff_after_attempts), 1)
         if count >= threshold:
-            self.failed_entry_blocked_until[ticker] = datetime.now(UTC) + timedelta(
+            self.failed_entry_blocked_until[ticker] = now + timedelta(
                 seconds=max(float(self.config.failed_entry_backoff_seconds), 0.0)
             )
             self._trace_execution_event(
@@ -1501,6 +1619,9 @@ class LiveTrader:
     def _clear_failed_entry_attempts(self, ticker: str) -> None:
         self.failed_entry_attempts.pop(ticker, None)
         self.failed_entry_blocked_until.pop(ticker, None)
+        self.failed_entry_last_attempt.pop(ticker, None)
+        self.failed_entry_last_price.pop(ticker, None)
+        self.failed_entry_last_edge.pop(ticker, None)
 
     def _apply_reentry_rules(
         self,
@@ -2031,6 +2152,19 @@ class LiveTrader:
             )
             self.position_strategies[market_ticker] = lock.strategy_name
             self.local_resting_entry_locks.pop(market_ticker, None)
+            fill_age_seconds = (observed_at - lock.created_at).total_seconds()
+            if fill_age_seconds < 5:
+                fill_bucket = "0-5s"
+            elif fill_age_seconds < 15:
+                fill_bucket = "5-15s"
+            elif fill_age_seconds < 30:
+                fill_bucket = "15-30s"
+            elif fill_age_seconds < 45:
+                fill_bucket = "30-45s"
+            elif fill_age_seconds < 90:
+                fill_bucket = "45-90s"
+            else:
+                fill_bucket = "90s+"
             self._trace_execution_event(
                 {
                     "event": "entry_filled",
@@ -2042,6 +2176,13 @@ class LiveTrader:
                     "gbm_edge": lock.gbm_edge,
                     "gbm_probability": lock.gbm_probability,
                     "observed_at": lock.observed_at or observed_at,
+                    "fill_age_seconds": fill_age_seconds,
+                    "fill_bucket": fill_bucket,
+                    "fill_edge": (
+                        float(lock.gbm_probability) - (int(lock.price_cents) / 100.0)
+                        if lock.gbm_probability is not None and lock.price_cents is not None
+                        else None
+                    ),
                 }
             )
 
@@ -2050,10 +2191,27 @@ class LiveTrader:
         current_candidate = candidate
         total_filled_contracts = 0
         max_attempts = max(int(self.config.execution_session_attempts), 1)
+        ladder_steps = self.config.execution_ladder_steps_cents
+        if ladder_steps is None or len(ladder_steps) == 0:
+            ladder_steps = (int(self.config.execution_cross_cents),) * max_attempts
+        distance_from_threshold = 0.0
+        if current_candidate.snapshot.threshold is not None:
+            if current_candidate.side == "yes":
+                distance_from_threshold = current_candidate.snapshot.spot_price - current_candidate.snapshot.threshold
+            else:
+                distance_from_threshold = current_candidate.snapshot.threshold - current_candidate.snapshot.spot_price
+        is_high_conviction = (
+            current_candidate.gbm_edge is not None
+            and current_candidate.gbm_edge >= float(self.config.high_conviction_edge_threshold)
+            and distance_from_threshold >= float(self.config.high_conviction_distance_threshold_dollars)
+        )
+        if self.config.execution_ladder_steps_cents_high and is_high_conviction:
+            ladder_steps = self.config.execution_ladder_steps_cents_high
         last_response: dict[str, Any] | None = None
         last_payload: dict[str, Any] | None = None
         last_status = "submitted"
         last_execution_price_cents = min(candidate.price_cents + max(self.config.execution_cross_cents, 0), 99)
+        last_order_id: str | None = None
         self._trace_execution_event(
             {
                 "event": "execution_session_start",
@@ -2069,7 +2227,100 @@ class LiveTrader:
             if remaining_contracts <= 0:
                 break
             snapshot = current_candidate.snapshot
-            execution_price_cents = min(current_candidate.price_cents + max(self.config.execution_cross_cents, 0), 99)
+            step_cents = int(
+                ladder_steps[min(attempt_index, len(ladder_steps) - 1)]
+                if ladder_steps
+                else self.config.execution_cross_cents
+            )
+            # Spread-aware execution
+            ask_cents, bid_cents = _side_prices(snapshot, current_candidate.side)
+            spread_cents: int | None = None
+            if ask_cents is not None and bid_cents is not None:
+                spread_cents = max(ask_cents - bid_cents, 0)
+                if spread_cents >= int(self.config.execution_spread_insane_cents):
+                    self._trace_execution_event(
+                        {
+                            "event": "execution_attempt_skipped_no_depth",
+                            "market_ticker": snapshot.market_ticker,
+                            "attempt": attempt_index + 1,
+                            "side": current_candidate.side,
+                            "strategy_name": current_candidate.strategy_name,
+                            "signal_price_cents": current_candidate.price_cents,
+                            "execution_price_cents": execution_price_cents,
+                            "orderbook_available_contracts": None,
+                            "min_fill_contracts": None,
+                            "reason": "spread_insane_skip",
+                            "spread_cents": spread_cents,
+                        }
+                    )
+                    return {
+                        "status": "skipped_no_depth",
+                        "side": current_candidate.side,
+                        "strategy_name": current_candidate.strategy_name,
+                        "confidence": current_candidate.confidence,
+                        "gbm_probability": current_candidate.gbm_probability,
+                        "gbm_edge": current_candidate.gbm_edge,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "filled_contracts": total_filled_contracts,
+                        "payload": None,
+                        "response": None,
+                        "attempts": attempts,
+                        "orderbook_available_contracts": None,
+                    }
+                if spread_cents <= int(self.config.execution_spread_tight_cents):
+                    step_cents = max(step_cents, int(self.config.execution_spread_tight_min_cross_cents))
+                if spread_cents >= int(self.config.execution_spread_wide_cents):
+                    step_cents = min(step_cents, int(self.config.execution_spread_wide_max_cross_cents))
+                    if attempt_index == 0 and step_cents <= 0:
+                        step_cents = 1
+            # Cap cross based on edge strength
+            execution_price_cents = min(current_candidate.price_cents + max(step_cents, 0), 99)
+            residual_edge = None
+            max_cross_from_edge = None
+            if current_candidate.gbm_probability is not None:
+                residual_edge = float(current_candidate.gbm_probability) - (execution_price_cents / 100.0)
+                max_cross_from_edge = max(int(math.floor(float(residual_edge) * 100.0)), 0)
+                step_cents = min(step_cents, max_cross_from_edge, 3)
+                execution_price_cents = min(current_candidate.price_cents + max(step_cents, 0), 99)
+                residual_edge = float(current_candidate.gbm_probability) - (execution_price_cents / 100.0)
+            if self.config.enforce_positive_edge_on_execution and residual_edge is not None:
+                min_edge_margin = float(
+                    self.config.execution_min_edge_margin_high if is_high_conviction else self.config.execution_min_edge_margin_low
+                )
+                if residual_edge < min_edge_margin:
+                    self._trace_execution_event(
+                        {
+                            "event": "execution_attempt_skipped_edge_negative",
+                            "market_ticker": snapshot.market_ticker,
+                            "attempt": attempt_index + 1,
+                            "side": current_candidate.side,
+                            "strategy_name": current_candidate.strategy_name,
+                            "signal_price_cents": current_candidate.price_cents,
+                            "execution_price_cents": execution_price_cents,
+                            "gbm_edge": current_candidate.gbm_edge,
+                            "residual_edge": residual_edge,
+                            "min_edge_margin": min_edge_margin,
+                            "max_cross_from_edge": max_cross_from_edge,
+                            "ladder_step_cents": step_cents,
+                            "reason": "edge_cap_blocked",
+                        }
+                    )
+                    return {
+                        "status": "skipped_edge_negative",
+                        "side": current_candidate.side,
+                        "strategy_name": current_candidate.strategy_name,
+                        "confidence": current_candidate.confidence,
+                        "gbm_probability": current_candidate.gbm_probability,
+                        "gbm_edge": current_candidate.gbm_edge,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "filled_contracts": total_filled_contracts,
+                        "payload": None,
+                        "response": None,
+                        "attempts": attempts,
+                        "orderbook_available_contracts": None,
+                    }
             orderbook_available_contracts: int | None = None
             orderbook_payload: dict[str, Any] | None = None
             if self.config.use_orderbook_precheck:
@@ -2094,8 +2345,13 @@ class LiveTrader:
                     "execution_price_cents": execution_price_cents,
                     "remaining_contracts": remaining_contracts,
                     "orderbook_available_contracts": orderbook_available_contracts,
+                    "ladder_step_cents": step_cents,
+                    "max_cross_from_edge": max_cross_from_edge,
+                    "residual_edge": residual_edge,
+                    "signal_edge": current_candidate.gbm_edge,
                 }
             )
+            low_depth = False
             if self.config.use_orderbook_precheck:
                 min_fill_contracts = max(
                     1,
@@ -2105,6 +2361,7 @@ class LiveTrader:
                     orderbook_available_contracts is not None
                     and orderbook_available_contracts < min_fill_contracts
                 ):
+                    low_depth = True
                     attempts.append(
                         {
                             "attempt": attempt_index + 1,
@@ -2115,34 +2372,30 @@ class LiveTrader:
                             "status": "skipped_no_depth",
                         }
                     )
+                    # Do not hard-skip on low depth; allow laddering unless spread is insane.
+            if low_depth and attempt_index == 0 and step_cents <= 0:
+                step_cents = 1
+                execution_price_cents = min(current_candidate.price_cents + max(step_cents, 0), 99)
+            if (
+                self.config.entry_time_in_force != "immediate_or_cancel"
+                and attempt_index > 0
+                and last_order_id
+            ):
+                try:
+                    self.client.cancel_order(last_order_id)
+                    if self.fill_feed is not None:
+                        self.fill_feed.deregister_order(snapshot.market_ticker)
+                    self.local_resting_entry_locks.pop(snapshot.market_ticker, None)
                     self._trace_execution_event(
                         {
-                            "event": "execution_attempt_skipped_no_depth",
+                            "event": "execution_attempt_canceled_previous",
                             "market_ticker": snapshot.market_ticker,
                             "attempt": attempt_index + 1,
-                            "side": current_candidate.side,
-                            "strategy_name": current_candidate.strategy_name,
-                            "signal_price_cents": current_candidate.price_cents,
-                            "execution_price_cents": execution_price_cents,
-                            "orderbook_available_contracts": orderbook_available_contracts,
-                            "min_fill_contracts": min_fill_contracts,
+                            "order_id": last_order_id,
                         }
                     )
-                    return {
-                        "status": "skipped_no_depth",
-                        "side": current_candidate.side,
-                        "strategy_name": current_candidate.strategy_name,
-                        "confidence": current_candidate.confidence,
-                        "gbm_probability": current_candidate.gbm_probability,
-                        "gbm_edge": current_candidate.gbm_edge,
-                        "signal_price_cents": current_candidate.price_cents,
-                        "execution_price_cents": execution_price_cents,
-                        "filled_contracts": total_filled_contracts,
-                        "payload": None,
-                        "response": None,
-                        "attempts": attempts,
-                        "orderbook_available_contracts": orderbook_available_contracts,
-                    }
+                except Exception:
+                    pass
             payload = {
                 "ticker": snapshot.market_ticker,
                 "action": "buy",
@@ -2199,6 +2452,7 @@ class LiveTrader:
             last_response = response
             last_payload = payload
             last_execution_price_cents = execution_price_cents
+            last_order_id = order_id
             if (
                 self.config.entry_time_in_force != "immediate_or_cancel"
                 and order_status in {"resting", "open", "submitted", "pending"}
@@ -2241,11 +2495,27 @@ class LiveTrader:
                     "filled_contracts": filled_contracts,
                     "exchange_filled_contracts": exchange_filled_contracts,
                     "orderbook_available_contracts": orderbook_available_contracts,
+                    "ladder_step_cents": step_cents,
+                    "max_cross_from_edge": max_cross_from_edge,
+                    "residual_edge": residual_edge,
+                    "signal_edge": current_candidate.gbm_edge,
+                    "submit_edge": residual_edge,
                 }
             )
             if total_filled_contracts >= int(candidate.contracts) or attempt_index >= max_attempts - 1:
                 break
-            time.sleep(max(float(self.config.execution_session_retry_delay_seconds), 0.0))
+            delay_seconds = float(self.config.execution_session_retry_delay_seconds)
+            if current_candidate.gbm_edge is not None:
+                if current_candidate.gbm_edge >= 0.06:
+                    delay_seconds = float(self.config.execution_ladder_delay_high_seconds)
+                elif current_candidate.gbm_edge >= 0.04:
+                    delay_seconds = float(self.config.execution_ladder_delay_mid_seconds)
+                else:
+                    delay_seconds = float(self.config.execution_ladder_delay_low_seconds)
+            tte_minutes = max((snapshot.expiry - snapshot.observed_at).total_seconds() / 60.0, 0.0)
+            if tte_minutes <= float(self.config.fast_market_tte_minutes):
+                delay_seconds = min(delay_seconds, float(self.config.fast_market_delay_ceiling_seconds))
+            time.sleep(max(delay_seconds, 0.0))
             refreshed_candidate = self._refresh_candidate_from_live_state(current_candidate=current_candidate)
             if refreshed_candidate is None:
                 self._trace_execution_event(

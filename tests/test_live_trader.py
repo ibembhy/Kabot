@@ -129,6 +129,7 @@ def test_select_entry_candidates_applies_exact_live_rules() -> None:
     assert {(candidate.strategy_name, candidate.snapshot.market_ticker, candidate.side) for candidate in selected} == {
         ("yes_continuation_mid", "A-YES-MID", "yes"),
         ("no_continuation_mid", "B-NO-MID", "no"),
+        ("no_continuation_mid", "D-NO-WIDE", "no"),
     }
 
 
@@ -323,14 +324,14 @@ def test_select_entry_candidates_caps_expensive_entries_to_single_contract() -> 
 
 def test_select_entry_candidates_rejects_entries_above_hard_cap() -> None:
     snapshots = [
-        _snapshot(
-            market_ticker="TOO-EXPENSIVE-YES",
-            minutes_to_expiry=4.0,
-            spot_price=68025.0,
-            threshold=68000.0,
-            yes_bid=0.60,
-            yes_ask=0.62,
-        ),
+            _snapshot(
+                market_ticker="TOO-EXPENSIVE-YES",
+                minutes_to_expiry=4.0,
+                spot_price=68025.0,
+                threshold=68000.0,
+                yes_bid=0.62,
+                yes_ask=0.64,
+            ),
     ]
 
     selected = select_entry_candidates(
@@ -901,6 +902,129 @@ def test_hard_stop_ignores_grace_and_confirmation() -> None:
     )
 
     assert len(exits) == 1
+
+
+def test_cancel_resting_entry_on_edge_decay() -> None:
+    class _CancelClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.canceled: list[str] = []
+
+        def cancel_order(self, order_id: str) -> dict:
+            self.canceled.append(order_id)
+            return {"order_id": order_id, "status": "canceled"}
+
+        def list_orders(self, status: str | None = None) -> dict:
+            return {"orders": [{"order_id": "rest-1", "ticker": "OPEN-YES", "action": "buy"}]}
+
+    client = _CancelClient()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            entry_time_in_force="good_till_canceled",
+            edge_decay_cancel_threshold=0.02,
+            distance_threshold_dollars=7.0,
+            gbm_min_points=3,
+        ),
+    )
+    observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    trader.local_resting_entry_locks["OPEN-YES"] = LocalRestingEntryLock(
+        created_at=observed_at - timedelta(seconds=5),
+        side="yes",
+        strategy_name="yes_continuation_mid",
+        price_cents=50,
+        gbm_edge=0.06,
+        observed_at=observed_at - timedelta(seconds=5),
+    )
+    snapshot = MarketSnapshot(
+        source="test",
+        series_ticker="KXBTC15M",
+        market_ticker="OPEN-YES",
+        contract_type="threshold",
+        underlying_symbol="BTC-USD",
+        observed_at=observed_at,
+        expiry=observed_at + timedelta(minutes=6),
+        spot_price=67900.0,
+        threshold=68000.0,
+        yes_bid=0.46,
+        yes_ask=0.47,
+        no_bid=0.53,
+        no_ask=0.54,
+        volume=10000.0,
+    )
+
+    trader._cancel_stale_resting_entry_orders(
+        observed_at=observed_at,
+        snapshots=[snapshot],
+        volatility=0.3,
+    )
+
+    assert "OPEN-YES" not in trader.local_resting_entry_locks
+    assert client.canceled == ["rest-1"]
+
+
+def test_cancel_resting_entry_on_max_age() -> None:
+    class _CancelClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.canceled: list[str] = []
+
+        def cancel_order(self, order_id: str) -> dict:
+            self.canceled.append(order_id)
+            return {"order_id": order_id, "status": "canceled"}
+
+        def list_orders(self, status: str | None = None) -> dict:
+            return {"orders": [{"order_id": "rest-2", "ticker": "OPEN-NO", "action": "buy"}]}
+
+    client = _CancelClient()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            entry_time_in_force="good_till_canceled",
+            resting_entry_max_age_seconds=30.0,
+            resting_entry_max_age_seconds_high=90.0,
+            high_conviction_edge_threshold=0.06,
+            high_conviction_distance_threshold_dollars=8.0,
+            distance_threshold_dollars=7.0,
+            gbm_min_points=3,
+        ),
+    )
+    observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    trader.local_resting_entry_locks["OPEN-NO"] = LocalRestingEntryLock(
+        created_at=observed_at - timedelta(seconds=45),
+        side="no",
+        strategy_name="no_continuation_mid",
+        price_cents=50,
+        gbm_edge=0.03,
+        observed_at=observed_at - timedelta(seconds=45),
+    )
+    snapshot = MarketSnapshot(
+        source="test",
+        series_ticker="KXBTC15M",
+        market_ticker="OPEN-NO",
+        contract_type="threshold",
+        underlying_symbol="BTC-USD",
+        observed_at=observed_at,
+        expiry=observed_at + timedelta(minutes=6),
+        spot_price=67980.0,
+        threshold=68000.0,
+        yes_bid=0.55,
+        yes_ask=0.56,
+        no_bid=0.44,
+        no_ask=0.45,
+        volume=10000.0,
+    )
+
+    trader._cancel_stale_resting_entry_orders(
+        observed_at=observed_at,
+        snapshots=[snapshot],
+        volatility=0.3,
+    )
+
+    assert "OPEN-NO" not in trader.local_resting_entry_locks
+    assert client.canceled == ["rest-2"]
 
 
 def test_submit_order_can_use_execution_session_and_write_trace(monkeypatch, tmp_path: Path) -> None:

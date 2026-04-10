@@ -116,8 +116,13 @@ def build_parser() -> argparse.ArgumentParser:
     live_trade.add_argument(
         "--profile",
         default="baseline_live",
-        choices=("baseline_live", "exp_12m_signal_break", "exp_12m_signal_break_execution"),
-        help="Named live profile. baseline_live keeps the current bot. exp_12m_signal_break enables the 12-minute strategy with signal-break exits. exp_12m_signal_break_execution runs that same strategy with the execution-session engine and no REST depth precheck.",
+        choices=("baseline_live", "exp_12m_signal_break", "exp_12m_signal_break_execution", "exp_fills2"),
+        help=(
+            "Named live profile. baseline_live keeps the current bot. "
+            "exp_12m_signal_break enables the 12-minute strategy with signal-break exits. "
+            "exp_12m_signal_break_execution runs that same strategy with the execution-session engine and no REST depth precheck. "
+            "exp_fills2 uses a 10-minute window, looser distance, and a controlled execution ladder."
+        ),
     )
     live_trade.add_argument("--series", default="KXBTC15M", help="Series ticker, default KXBTC15M")
     live_trade.add_argument("--poll-seconds", type=int, default=10, help="Polling interval, default 10 seconds")
@@ -595,24 +600,47 @@ def main(argv: Sequence[str] | None = None) -> None:
         store = PostgresStore(settings.storage["db_dsn"])
         profile = str(args.profile)
         uses_12m_strategy = profile in {"exp_12m_signal_break", "exp_12m_signal_break_execution"}
-        entry_max_tte_minutes = 12.0 if uses_12m_strategy else 10.0
-        enable_signal_break_exit = uses_12m_strategy
-        enable_execution_sessions = profile == "exp_12m_signal_break_execution"
+        uses_fills2 = profile == "exp_fills2"
+        entry_max_tte_minutes = 10.0 if uses_fills2 else (12.0 if uses_12m_strategy else 10.0)
+        enable_signal_break_exit = uses_12m_strategy or uses_fills2
+        enable_execution_sessions = profile in {"exp_12m_signal_break_execution", "exp_fills2"}
         enable_signal_break_reentry = False
-        use_orderbook_precheck = profile != "exp_12m_signal_break_execution"
-        entry_time_in_force = "good_till_canceled" if profile == "exp_12m_signal_break_execution" else "immediate_or_cancel"
-        execution_cross_cents = 0 if profile == "exp_12m_signal_break_execution" else 6
-        min_market_volume = 1000.0 if profile == "exp_12m_signal_break_execution" else 5000.0
-        exit_cross_cents = 4 if uses_12m_strategy else 1
-        exit_distance_threshold_dollars = 3.0 if uses_12m_strategy else 10.0
-        signal_break_confirmation_cycles = 3 if uses_12m_strategy else 1
-        exit_negative_edge_threshold = -0.02 if uses_12m_strategy else 0.0
-        price_stop_cents = 15 if uses_12m_strategy else 0
-        price_stop_grace_seconds = 90 if uses_12m_strategy else 0
-        price_stop_confirm_cycles = 3 if uses_12m_strategy else 1
-        hard_stop_cents = 22 if uses_12m_strategy else 0
-        reentry_edge_premium = 0.01 if profile == "exp_12m_signal_break_execution" else 0.02
-        reentry_min_price_improvement_cents = 1 if profile == "exp_12m_signal_break_execution" else 3
+        use_orderbook_precheck = profile not in {"exp_12m_signal_break_execution"} or uses_fills2
+        entry_time_in_force = "good_till_canceled" if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else "immediate_or_cancel"
+        execution_cross_cents = 0 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 6
+        min_market_volume = 1000.0 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 5000.0
+        exit_cross_cents = 4 if (uses_12m_strategy or uses_fills2) else 1
+        exit_distance_threshold_dollars = 3.0 if (uses_12m_strategy or uses_fills2) else 10.0
+        signal_break_confirmation_cycles = 3 if (uses_12m_strategy or uses_fills2) else 1
+        exit_negative_edge_threshold = -0.02 if (uses_12m_strategy or uses_fills2) else 0.0
+        price_stop_cents = 15 if (uses_12m_strategy or uses_fills2) else 0
+        price_stop_grace_seconds = 90 if (uses_12m_strategy or uses_fills2) else 0
+        price_stop_confirm_cycles = 3 if (uses_12m_strategy or uses_fills2) else 1
+        hard_stop_cents = 22 if (uses_12m_strategy or uses_fills2) else 0
+        reentry_edge_premium = 0.01 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 0.02
+        reentry_min_price_improvement_cents = 1 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 3
+        distance_threshold_dollars = 6.0 if uses_fills2 else 10.0
+        execution_ladder_steps_cents = (0, 1, 2, 3) if uses_fills2 else None
+        execution_ladder_steps_cents_high = (1, 2, 3, 3) if uses_fills2 else None
+        high_conviction_edge_threshold = 0.06 if uses_fills2 else 0.0
+        enforce_positive_edge_on_execution = True if uses_fills2 else False
+        high_conviction_distance_threshold_dollars = 8.0 if uses_fills2 else 0.0
+        execution_min_edge_margin_low = 0.01 if uses_fills2 else 0.0
+        execution_min_edge_margin_high = 0.0 if uses_fills2 else 0.0
+        gbm_min_edge_mid = 0.015 if uses_fills2 else 0.02
+        gbm_min_edge_wide_yes = 0.03 if uses_fills2 else 0.04
+        execution_spread_tight_cents = 2 if uses_fills2 else 2
+        execution_spread_wide_cents = 6 if uses_fills2 else 6
+        execution_spread_tight_min_cross_cents = 2 if uses_fills2 else 2
+        execution_spread_wide_max_cross_cents = 1 if uses_fills2 else 1
+        execution_ladder_delay_high_seconds = 5.0 if uses_fills2 else 5.0
+        execution_ladder_delay_mid_seconds = 8.0 if uses_fills2 else 8.0
+        execution_ladder_delay_low_seconds = 12.0 if uses_fills2 else 12.0
+        fast_market_tte_minutes = 5.0 if uses_fills2 else 5.0
+        fast_market_delay_ceiling_seconds = 6.0 if uses_fills2 else 6.0
+        resting_entry_max_age_seconds = 45.0 if uses_fills2 else 45.0
+        resting_entry_max_age_seconds_high = 90.0 if uses_fills2 else 90.0
+        edge_decay_cancel_threshold = 0.02 if uses_fills2 else 0.02
         trader = build_live_trader(
             store=store,
             config=LiveTraderConfig(
@@ -633,12 +661,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 max_spot_age_seconds=args.max_spot_age_seconds,
                 max_market_age_seconds=args.max_market_age_seconds,
                 entry_max_tte_minutes=entry_max_tte_minutes,
+                distance_threshold_dollars=distance_threshold_dollars,
                 enable_signal_break_exit=enable_signal_break_exit,
                 enable_execution_sessions=enable_execution_sessions,
                 enable_signal_break_reentry=enable_signal_break_reentry,
                 use_orderbook_precheck=use_orderbook_precheck,
                 entry_time_in_force=entry_time_in_force,
                 execution_cross_cents=execution_cross_cents,
+                execution_ladder_steps_cents=execution_ladder_steps_cents,
+                execution_ladder_steps_cents_high=execution_ladder_steps_cents_high,
+                high_conviction_edge_threshold=high_conviction_edge_threshold,
+                high_conviction_distance_threshold_dollars=high_conviction_distance_threshold_dollars,
+                enforce_positive_edge_on_execution=enforce_positive_edge_on_execution,
+                execution_min_edge_margin_low=execution_min_edge_margin_low,
+                execution_min_edge_margin_high=execution_min_edge_margin_high,
+                gbm_min_edge_mid=gbm_min_edge_mid,
+                gbm_min_edge_wide_yes=gbm_min_edge_wide_yes,
                 min_market_volume=min_market_volume,
                 exit_cross_cents=exit_cross_cents,
                 exit_distance_threshold_dollars=exit_distance_threshold_dollars,
@@ -650,8 +688,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 hard_stop_cents=hard_stop_cents,
                 reentry_edge_premium=reentry_edge_premium,
                 reentry_min_price_improvement_cents=reentry_min_price_improvement_cents,
-                execution_session_attempts=1,
-                max_contracts_per_order=4 if profile == "exp_12m_signal_break_execution" else 2,
+        execution_session_attempts=4 if uses_fills2 else 1,
+        execution_session_retry_delay_seconds=10.0 if uses_fills2 else 0.05,
+        failed_entry_backoff_seconds=10.0 if uses_fills2 else 30.0,
+                failed_entry_backoff_after_attempts=5 if uses_fills2 else 3,
+                execution_spread_tight_cents=execution_spread_tight_cents,
+                execution_spread_wide_cents=execution_spread_wide_cents,
+                execution_spread_tight_min_cross_cents=execution_spread_tight_min_cross_cents,
+                execution_spread_wide_max_cross_cents=execution_spread_wide_max_cross_cents,
+                execution_ladder_delay_high_seconds=execution_ladder_delay_high_seconds,
+                execution_ladder_delay_mid_seconds=execution_ladder_delay_mid_seconds,
+                execution_ladder_delay_low_seconds=execution_ladder_delay_low_seconds,
+                fast_market_tte_minutes=fast_market_tte_minutes,
+                fast_market_delay_ceiling_seconds=fast_market_delay_ceiling_seconds,
+                resting_entry_max_age_seconds=resting_entry_max_age_seconds,
+                resting_entry_max_age_seconds_high=resting_entry_max_age_seconds_high,
+                edge_decay_cancel_threshold=edge_decay_cancel_threshold,
+                max_contracts_per_order=4 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 2,
+                min_orderbook_fill_fraction=0.0 if uses_fills2 else 0.5,
             ),
         )
         if args.once:

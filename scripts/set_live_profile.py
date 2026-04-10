@@ -15,6 +15,7 @@ PROFILE_COMMANDS = {
     "baseline_live": f"ExecStart={BASE_COMMAND}",
     "exp_12m_signal_break": f"ExecStart={BASE_COMMAND.replace('live-trade', 'live-trade --profile exp_12m_signal_break')}",
     "exp_12m_signal_break_execution": f"ExecStart={BASE_COMMAND.replace('live-trade', 'live-trade --profile exp_12m_signal_break_execution')}",
+    "exp_fills2": f"ExecStart={BASE_COMMAND.replace('live-trade', 'live-trade --profile exp_fills2')}",
 }
 
 

@@ -27,6 +27,8 @@ def summarize(events: list[dict]) -> dict:
     completes = [event for event in events if event.get("event") == "execution_session_complete"]
     submitted = [event for event in events if event.get("event") == "execution_attempt_submitted"]
     skipped = [event for event in events if event.get("event") == "execution_attempt_skipped_no_depth"]
+    fills = [event for event in events if event.get("event") == "entry_filled"]
+    cancels = [event for event in events if event.get("event") == "resting_entry_canceled"]
 
     by_market: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for event in events:
@@ -39,6 +41,9 @@ def summarize(events: list[dict]) -> dict:
     successful_sessions = sum(1 for event in completes if int(event.get("filled_contracts", 0) or 0) > 0)
     strategy_counter = Counter(str(event.get("strategy_name") or "unknown") for event in completes)
     status_counter = Counter(str(event.get("status") or "unknown") for event in completes)
+    ladder_submits = Counter(str(event.get("ladder_step_cents") or "unknown") for event in submitted)
+    fill_buckets = Counter(str(event.get("fill_bucket") or "unknown") for event in fills)
+    cancel_reasons = Counter(str(event.get("reason") or "unknown") for event in cancels)
 
     return {
         "sessions_started": len(starts),
@@ -50,6 +55,9 @@ def summarize(events: list[dict]) -> dict:
         "total_filled_contracts": total_filled,
         "completed_statuses": dict(status_counter),
         "completed_strategies": dict(strategy_counter),
+        "ladder_step_submissions": dict(ladder_submits),
+        "fill_age_buckets": dict(fill_buckets),
+        "resting_cancel_reasons": dict(cancel_reasons),
     }
 
 

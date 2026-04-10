@@ -13,6 +13,7 @@ PROFILE_LABELS = {
     "baseline_live": "Kabot",
     "exp_12m_signal_break": "K12+SE",
     "exp_12m_signal_break_execution": "+Fills",
+    "exp_fills2": "+Fills2",
 }
 
 
