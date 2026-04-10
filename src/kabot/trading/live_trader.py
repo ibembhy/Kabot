@@ -1,0 +1,2678 @@
+from __future__ import annotations
+
+import base64
+import json
+import math
+import os
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import numpy as np
+import pandas as pd
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+from kabot.compat import UTC
+from kabot.markets.normalize import normalize_market
+from kabot.models.gbm_threshold import GBMThresholdModel
+from kabot.storage.postgres import PostgresStore
+from kabot.trading.execution_state import ExecutionStateStore
+from kabot.trading.execution_trace import ExecutionTraceWriter
+from kabot.trading.ws_feeds import CoinbaseSpotFeed, KalshiFillFeed, KalshiTickerFeed
+from kabot.types import MarketSnapshot, Position
+
+
+def _probability_to_cents(value: float | None) -> int | None:
+    if value is None:
+        return None
+    return int(round(max(0.0, min(1.0, float(value))) * 100.0))
+
+
+def _time_to_expiry_minutes(snapshot: MarketSnapshot) -> float:
+    return max((snapshot.expiry - snapshot.observed_at).total_seconds() / 60.0, 0.0)
+
+
+def _yes_spread_cents(snapshot: MarketSnapshot) -> int | None:
+    ask = _probability_to_cents(snapshot.yes_ask)
+    bid = _probability_to_cents(snapshot.yes_bid)
+    if ask is None or bid is None:
+        return None
+    return ask - bid
+
+
+@dataclass(frozen=True)
+class StrategyCandidate:
+    strategy_name: str
+    confidence: str
+    snapshot: MarketSnapshot
+    side: str
+    price_cents: int
+    contracts: int
+    gbm_probability: float | None = None
+    gbm_edge: float | None = None
+
+
+@dataclass(frozen=True)
+class StrategyRule:
+    name: str
+    side: str
+    min_tte_minutes: float
+    max_tte_minutes: float
+    min_price_cents: int
+    max_price_cents: int
+    max_spread_cents: int
+
+
+STRATEGY_RULES: tuple[StrategyRule, ...] = (
+    StrategyRule(
+        name="yes_continuation_mid",
+        side="yes",
+        min_tte_minutes=0.0,
+        max_tte_minutes=10.0,
+        min_price_cents=45,
+        max_price_cents=58,
+        max_spread_cents=6,
+    ),
+    StrategyRule(
+        name="no_continuation_mid",
+        side="no",
+        min_tte_minutes=0.0,
+        max_tte_minutes=10.0,
+        min_price_cents=45,
+        max_price_cents=58,
+        max_spread_cents=6,
+    ),
+    StrategyRule(
+        name="yes_continuation_wide",
+        side="yes",
+        min_tte_minutes=0.0,
+        max_tte_minutes=10.0,
+        min_price_cents=45,
+        max_price_cents=58,
+        max_spread_cents=8,
+    ),
+    StrategyRule(
+        name="no_continuation_wide",
+        side="no",
+        min_tte_minutes=0.0,
+        max_tte_minutes=10.0,
+        min_price_cents=45,
+        max_price_cents=58,
+        max_spread_cents=8,
+    ),
+)
+
+SOFT_ENTRY_CAP_CENTS = 55
+HARD_ENTRY_CAP_CENTS = 60
+EXPENSIVE_ENTRY_EDGE_PREMIUM = 0.02
+
+
+def _strategy_rules_with_max_tte(max_tte_minutes: float) -> tuple[StrategyRule, ...]:
+    return tuple(replace(rule, max_tte_minutes=max_tte_minutes) for rule in STRATEGY_RULES)
+
+
+@dataclass(frozen=True)
+class ClosedTrade:
+    market_ticker: str
+    strategy_name: str
+    closed_at: datetime
+    realized_pnl_cents: int
+
+
+@dataclass
+class SignalBreakReentryState:
+    market_ticker: str
+    exited_at: datetime
+    exit_side: str
+    exit_strategy_name: str
+    exit_reference_price_cents: int
+    exit_execution_price_cents: int
+    successful_reentries: int = 0
+
+
+@dataclass
+class PendingSignalBreakState:
+    reason: str
+    count: int = 1
+
+
+@dataclass
+class LocalRestingEntryLock:
+    created_at: datetime
+    side: str = ""
+    strategy_name: str = ""
+    price_cents: int | None = None
+    gbm_edge: float | None = None
+    gbm_probability: float | None = None
+    observed_at: datetime | None = None
+    contracts: int | None = None
+
+
+def _side_prices(snapshot: MarketSnapshot, side: str) -> tuple[int | None, int | None]:
+    if side == "yes":
+        return _probability_to_cents(snapshot.yes_ask), _probability_to_cents(snapshot.yes_bid)
+    return _probability_to_cents(snapshot.no_ask), _probability_to_cents(snapshot.no_bid)
+
+
+def _increment_reason(counts: dict[str, int], reason: str) -> None:
+    counts[reason] = counts.get(reason, 0) + 1
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _confidence_for_candidate(
+    *,
+    rule_name: str,
+    tte_minutes: float,
+    ask_cents: int,
+    spread_cents: int,
+) -> str:
+    if rule_name in {"yes_continuation_mid", "no_continuation_mid"}:
+        if spread_cents <= 2 and tte_minutes <= 3.0 and 45 <= ask_cents <= 55:
+            return "high"
+        return "medium"
+    return "low"
+
+
+def _effective_contracts_for_price(*, ask_cents: int, contracts: int) -> int:
+    if ask_cents > SOFT_ENTRY_CAP_CENTS:
+        return min(contracts, 1)
+    return contracts
+
+
+def _contracts_for_candidate(*, confidence: str, price_cents: int, available_balance_cents: int | None) -> int:
+    target_contracts = 2 if confidence == "high" else 1
+    if available_balance_cents is None:
+        return target_contracts
+    affordable = max(available_balance_cents // max(price_cents, 1), 0)
+    return max(0, min(target_contracts, affordable))
+
+
+def _dynamic_contracts_for_candidate(
+    *,
+    price_cents: int,
+    current_market_contracts: int,
+    bankroll_cents: int | None,
+    available_balance_cents: int | None,
+    deployed_cents: int,
+    per_market_fraction: float,
+    max_total_deployed_fraction: float,
+    max_notional_per_market_cents: int,
+    max_contracts_per_order: int,
+    max_contracts_per_market: int,
+) -> int:
+    if price_cents <= 0:
+        return 0
+    if available_balance_cents is None:
+        affordable = 1
+    else:
+        affordable = max(available_balance_cents // price_cents, 0)
+    if affordable <= 0:
+        return 0
+    if bankroll_cents is None:
+        target_notional_cents = price_cents
+        remaining_deployable_cents = price_cents
+    else:
+        bankroll_cents = max(int(bankroll_cents), 0)
+        target_notional_cents = min(
+            int(bankroll_cents * max(per_market_fraction, 0.0)),
+            max_notional_per_market_cents,
+        )
+        max_total_deployed_cents = int(bankroll_cents * max(max_total_deployed_fraction, 0.0))
+        remaining_deployable_cents = max(max_total_deployed_cents - max(deployed_cents, 0), 0)
+    effective_budget_cents = min(target_notional_cents, remaining_deployable_cents)
+    if effective_budget_cents < price_cents:
+        return 0
+    contracts = effective_budget_cents // price_cents
+    remaining_market_capacity = max(max_contracts_per_market - max(current_market_contracts, 0), 0)
+    return max(0, min(int(contracts), affordable, max_contracts_per_order, remaining_market_capacity))
+
+
+def select_entry_candidates(
+    snapshots: list[MarketSnapshot],
+    *,
+    blocked_markets: set[str],
+    current_position_contracts: dict[str, int],
+    current_position_strategies: dict[str, str],
+    active_strategy_counts: dict[str, int],
+    open_market_count: int,
+    max_open_markets: int,
+    max_strategy_open_counts: dict[str, int],
+    available_balance_cents: int | None = None,
+    bankroll_cents: int | None = None,
+    deployed_cents: int = 0,
+    distance_threshold_dollars: float = 0.0,
+    per_market_fraction: float = 0.08,
+    max_total_deployed_fraction: float = 0.24,
+    max_notional_per_market_cents: int = 500,
+    max_contracts_per_order: int = 2,
+    max_contracts_per_market: int = 4,
+    min_market_volume: float = 0.0,
+    strategy_rules: tuple[StrategyRule, ...] = STRATEGY_RULES,
+) -> list[StrategyCandidate]:
+    if open_market_count >= max_open_markets and not current_position_contracts:
+        return []
+
+    candidates: list[StrategyCandidate] = []
+    allocated_cents = 0
+    projected_open_market_count = open_market_count
+    for snapshot in sorted(snapshots, key=lambda item: (item.expiry, item.market_ticker)):
+        if snapshot.market_ticker in blocked_markets:
+            continue
+        if snapshot.contract_type != "threshold":
+            continue
+        if snapshot.threshold is None:
+            continue
+        if (snapshot.volume or 0.0) < min_market_volume:
+            continue
+        tte_minutes = _time_to_expiry_minutes(snapshot)
+        existing_contracts = int(current_position_contracts.get(snapshot.market_ticker, 0))
+        existing_strategy = current_position_strategies.get(snapshot.market_ticker)
+        if existing_contracts <= 0 and projected_open_market_count >= max_open_markets:
+            continue
+        for rule in strategy_rules:
+            current_strategy_count = int(active_strategy_counts.get(rule.name, 0))
+            strategy_cap = int(max_strategy_open_counts.get(rule.name, max_open_markets))
+            if existing_contracts > 0 and existing_strategy not in ("", None, rule.name):
+                continue
+            if existing_contracts <= 0 and current_strategy_count >= strategy_cap:
+                continue
+            if not (rule.min_tte_minutes < tte_minutes < rule.max_tte_minutes):
+                continue
+            if rule.side == "yes" and snapshot.spot_price < (snapshot.threshold + distance_threshold_dollars):
+                continue
+            if rule.side == "no" and snapshot.spot_price > (snapshot.threshold - distance_threshold_dollars):
+                continue
+            ask_cents, bid_cents = _side_prices(snapshot, rule.side)
+            if ask_cents is None or bid_cents is None:
+                continue
+            spread_cents = ask_cents - bid_cents
+            if not (rule.min_price_cents <= ask_cents <= rule.max_price_cents):
+                continue
+            if spread_cents >= rule.max_spread_cents:
+                continue
+            confidence = _confidence_for_candidate(
+                rule_name=rule.name,
+                tte_minutes=tte_minutes,
+                ask_cents=ask_cents,
+                spread_cents=spread_cents,
+            )
+            contracts = _dynamic_contracts_for_candidate(
+                price_cents=ask_cents,
+                current_market_contracts=existing_contracts,
+                bankroll_cents=bankroll_cents,
+                available_balance_cents=available_balance_cents,
+                deployed_cents=deployed_cents + allocated_cents,
+                per_market_fraction=per_market_fraction,
+                max_total_deployed_fraction=max_total_deployed_fraction,
+                max_notional_per_market_cents=max_notional_per_market_cents,
+                max_contracts_per_order=max_contracts_per_order,
+                max_contracts_per_market=max_contracts_per_market,
+            )
+            contracts = _effective_contracts_for_price(ask_cents=ask_cents, contracts=contracts)
+            if contracts <= 0:
+                continue
+            candidates.append(
+                StrategyCandidate(
+                    strategy_name=rule.name,
+                    confidence=confidence,
+                    snapshot=snapshot,
+                    side=rule.side,
+                    price_cents=ask_cents,
+                    contracts=contracts,
+                )
+            )
+            allocated_cents += contracts * ask_cents
+            blocked_markets.add(snapshot.market_ticker)
+            current_position_contracts[snapshot.market_ticker] = existing_contracts + contracts
+            current_position_strategies[snapshot.market_ticker] = rule.name
+            if existing_contracts <= 0:
+                active_strategy_counts[rule.name] = current_strategy_count + 1
+                projected_open_market_count += 1
+            break
+    return candidates
+
+
+def summarize_rejections(
+    snapshots: list[MarketSnapshot],
+    *,
+    blocked_markets: set[str],
+    blocked_reason_sets: dict[str, set[str]] | None = None,
+    active_strategy_counts: dict[str, int],
+    open_market_count: int,
+    max_open_markets: int,
+    max_strategy_open_counts: dict[str, int],
+    distance_threshold_dollars: float = 0.0,
+    min_market_volume: float = 0.0,
+    strategy_rules: tuple[StrategyRule, ...] = STRATEGY_RULES,
+) -> dict[str, int]:
+    reason_counts: dict[str, int] = {}
+    if open_market_count >= max_open_markets:
+        return {"max_open_markets_reached": len(snapshots)}
+
+    for snapshot in sorted(snapshots, key=lambda item: (item.expiry, item.market_ticker)):
+        if snapshot.market_ticker in blocked_markets:
+            blocked_reason = "market_already_active"
+            if blocked_reason_sets:
+                for reason, tickers in blocked_reason_sets.items():
+                    if snapshot.market_ticker in tickers:
+                        blocked_reason = reason
+                        break
+            _increment_reason(reason_counts, blocked_reason)
+            continue
+        if snapshot.contract_type != "threshold":
+            _increment_reason(reason_counts, "unsupported_contract_type")
+            continue
+        if snapshot.threshold is None:
+            _increment_reason(reason_counts, "missing_threshold")
+            continue
+        if (snapshot.volume or 0.0) < min_market_volume:
+            _increment_reason(reason_counts, "volume_below_threshold")
+            continue
+
+        tte_minutes = _time_to_expiry_minutes(snapshot)
+        matched = False
+        saw_strategy_cap = False
+        saw_tte_failure = False
+        saw_direction_failure = False
+        saw_missing_price = False
+        saw_price_band_failure = False
+        saw_spread_failure = False
+
+        for rule in strategy_rules:
+            current_strategy_count = int(active_strategy_counts.get(rule.name, 0))
+            strategy_cap = int(max_strategy_open_counts.get(rule.name, max_open_markets))
+            if current_strategy_count >= strategy_cap:
+                saw_strategy_cap = True
+                continue
+            if not (rule.min_tte_minutes < tte_minutes < rule.max_tte_minutes):
+                saw_tte_failure = True
+                continue
+            if rule.side == "yes" and snapshot.spot_price < (snapshot.threshold + distance_threshold_dollars):
+                saw_direction_failure = True
+                continue
+            if rule.side == "no" and snapshot.spot_price > (snapshot.threshold - distance_threshold_dollars):
+                saw_direction_failure = True
+                continue
+            ask_cents, bid_cents = _side_prices(snapshot, rule.side)
+            if ask_cents is None or bid_cents is None:
+                saw_missing_price = True
+                continue
+            spread_cents = ask_cents - bid_cents
+            if not (rule.min_price_cents <= ask_cents <= rule.max_price_cents):
+                saw_price_band_failure = True
+                continue
+            if spread_cents >= rule.max_spread_cents:
+                saw_spread_failure = True
+                continue
+            matched = True
+            break
+
+        if matched:
+            continue
+        if saw_spread_failure:
+            _increment_reason(reason_counts, "spread_too_wide")
+        elif saw_price_band_failure:
+            _increment_reason(reason_counts, "price_out_of_band")
+        elif saw_missing_price:
+            _increment_reason(reason_counts, "missing_prices")
+        elif saw_direction_failure:
+            _increment_reason(reason_counts, "spot_threshold_direction_mismatch")
+        elif saw_tte_failure:
+            _increment_reason(reason_counts, "tte_out_of_window")
+        elif saw_strategy_cap:
+            _increment_reason(reason_counts, "strategy_cap_reached")
+        else:
+            _increment_reason(reason_counts, "no_matching_rule")
+
+    return reason_counts
+
+
+@dataclass(frozen=True)
+class LiveTraderConfig:
+    active_profile: str = "baseline_live"
+    series_ticker: str = "KXBTC15M"
+    poll_seconds: int = 10
+    max_open_markets: int = 3
+    contracts_per_trade: int = 1
+    dry_run: bool = False
+    daily_loss_stop_cents: int = 1000
+    max_trades_per_day: int = 0
+    max_strategy_open_counts: dict[str, int] | None = None
+    cooldown_loss_streak: int = 3
+    cooldown_minutes: int = 30
+    max_spot_age_seconds: int = 30
+    max_market_age_seconds: int = 30
+    min_market_volume: float = 5000.0
+    distance_threshold_dollars: float = 10.0
+    gbm_min_edge_mid: float = 0.02
+    gbm_min_edge_wide_yes: float = 0.04
+    gbm_lookback_minutes: int = 90
+    gbm_min_points: int = 20
+    gbm_volatility_floor: float = 0.05
+    position_fraction_per_market: float = 0.08
+    max_total_deployed_fraction: float = 0.24
+    max_notional_per_market_cents: int = 500
+    max_contracts_per_order: int = 2
+    max_contracts_per_market: int = 4
+    entry_max_tte_minutes: float = 10.0
+    enable_signal_break_exit: bool = False
+    enable_execution_sessions: bool = False
+    enable_signal_break_reentry: bool = False
+    use_orderbook_precheck: bool = True
+    execution_cross_cents: int = 6
+    exit_cross_cents: int = 4
+    execution_session_attempts: int = 3
+    execution_session_retry_delay_seconds: float = 0.05
+    execution_session_use_rest_fallback: bool = True
+    execution_trace_path: str | None = "data/execution_trace.jsonl"
+    execution_heartbeat_seconds: float = 2.0
+    event_loop_sleep_seconds: float = 0.1
+    reentry_edge_premium: float = 0.02
+    reentry_max_per_market: int = 1
+    reentry_min_price_improvement_cents: int = 3
+    exit_distance_threshold_dollars: float = 5.0
+    signal_break_confirmation_cycles: int = 2
+    exit_negative_edge_threshold: float = -0.01
+    price_stop_cents: int = 0
+    price_stop_grace_seconds: int = 0
+    price_stop_confirm_cycles: int = 1
+    hard_stop_cents: int = 0
+    max_ws_quote_age_seconds: float = 10.0
+    failed_entry_backoff_seconds: float = 30.0
+    failed_entry_backoff_after_attempts: int = 3
+    local_resting_entry_lock_seconds: float = 2.0
+    min_orderbook_fill_fraction: float = 0.5
+    resting_order_retry_delay_seconds: float = 2.0
+    ioc_retry_delay_seconds: float = 0.15
+    max_entry_retries: int = 1
+    entry_time_in_force: str = "immediate_or_cancel"
+    exit_time_in_force: str = "immediate_or_cancel"
+    metadata_refresh_seconds: int = 60
+
+
+@dataclass(frozen=True)
+class KalshiAuthConfig:
+    api_key_id: str
+    private_key_path: str
+
+
+class KalshiAuthSigner:
+    def __init__(self, config: KalshiAuthConfig) -> None:
+        self.config = config
+        self._private_key = self._load_private_key(config.private_key_path)
+
+    @staticmethod
+    def _load_private_key(path: str):
+        private_key_bytes = Path(path).expanduser().read_bytes()
+        return serialization.load_pem_private_key(private_key_bytes, password=None)
+
+    @staticmethod
+    def _timestamp_ms() -> str:
+        return str(int(datetime.now(UTC).timestamp() * 1000))
+
+    def _sign(self, *, timestamp: str, method: str, path: str) -> str:
+        message = f"{timestamp}{method.upper()}{path}".encode("utf-8")
+        signature = self._private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode("utf-8")
+
+    def request_headers(self, *, method: str, path: str) -> dict[str, str]:
+        normalized_path = path.split("?", 1)[0]
+        if not normalized_path.startswith("/trade-api/"):
+            normalized_path = f"/trade-api/v2{normalized_path if normalized_path.startswith('/') else f'/{normalized_path}'}"
+        timestamp = self._timestamp_ms()
+        signature = self._sign(timestamp=timestamp, method=method, path=normalized_path)
+        return {
+            "KALSHI-ACCESS-KEY": self.config.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+        }
+
+
+@dataclass
+class KabotKalshiClient:
+    base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
+    timeout_seconds: int = 10
+    auth_signer: KalshiAuthSigner | None = None
+
+    def __post_init__(self) -> None:
+        self.session = requests.Session()
+        self.session.trust_env = False
+
+    def list_markets(self, *, series_ticker: str, status: str = "open", limit: int = 200) -> list[dict[str, Any]]:
+        markets: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "series_ticker": series_ticker,
+                "status": status,
+                "limit": limit,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            response = self.session.get(f"{self.base_url}/markets", params=params, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            payload = response.json()
+            markets.extend(payload.get("markets", []))
+            cursor = payload.get("cursor") or None
+            if not cursor:
+                break
+        return markets
+
+    def get_positions(self) -> dict[str, Any]:
+        return self._request_json("GET", "/portfolio/positions")
+
+    def list_orders(self, *, status: str | None = None, limit: int = 200) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        return self._request_json("GET", "/portfolio/orders", params=params)
+
+    def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("POST", "/portfolio/orders", json_payload=payload)
+
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        return self._request_json("GET", f"/portfolio/orders/{order_id}")
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        return self._request_json("DELETE", f"/portfolio/orders/{order_id}")
+
+    def get_balance(self) -> dict[str, Any]:
+        return self._request_json("GET", "/portfolio/balance")
+
+    def get_market(self, ticker: str) -> dict[str, Any]:
+        response = self.session.get(f"{self.base_url}/markets/{ticker}", timeout=self.timeout_seconds)
+        response.raise_for_status()
+        return response.json()
+
+    def get_orderbook(self, ticker: str) -> dict[str, Any]:
+        response = self.session.get(f"{self.base_url}/markets/{ticker}/orderbook", timeout=self.timeout_seconds)
+        response.raise_for_status()
+        return response.json()
+
+    def get_fills(
+        self,
+        *,
+        order_id: str | None = None,
+        ticker: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if order_id:
+            params["order_id"] = order_id
+        if ticker:
+            params["ticker"] = ticker
+        return self._request_json("GET", "/portfolio/fills", params=params)
+
+    def fetch_spot_price(self, product_id: str = "BTC-USD") -> tuple[float, datetime]:
+        response = self.session.get(
+            f"https://api.exchange.coinbase.com/products/{product_id}/ticker",
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        observed_at = datetime.now(UTC)
+        time_raw = payload.get("time")
+        if time_raw:
+            try:
+                observed_at = datetime.fromisoformat(str(time_raw).replace("Z", "+00:00")).astimezone(UTC)
+            except ValueError:
+                observed_at = datetime.now(UTC)
+        return float(payload["price"]), observed_at
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        headers: dict[str, str] = {}
+        if self.auth_signer is not None:
+            headers.update(self.auth_signer.request_headers(method=method, path=path))
+        response = self.session.request(
+            method=method.upper(),
+            url=f"{self.base_url}{path}",
+            params=params,
+            json=json_payload,
+            headers=headers,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _extract_position_count(position: dict[str, Any]) -> float:
+    raw_position = position.get("position")
+    if raw_position in (None, ""):
+        raw_position = position.get("position_fp")
+    if raw_position in (None, ""):
+        raw_position = position.get("count")
+    if raw_position in (None, ""):
+        raw_position = position.get("count_fp")
+    try:
+        return float(raw_position or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_fill_count(order: dict[str, Any]) -> int:
+    for key in ("fill_count_fp", "fill_count", "count_fp", "count"):
+        raw = order.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            return int(round(float(raw)))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _extract_positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("market_positions", "positions", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _extract_orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("orders", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _extract_fills(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("fills", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _extract_order_status(order: dict[str, Any]) -> str:
+    for key in ("status", "order_status"):
+        value = order.get(key)
+        if value not in (None, ""):
+            return str(value).lower()
+    return ""
+
+
+def _extract_order_id(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    order = payload.get("order")
+    if isinstance(order, dict):
+        return str(order.get("order_id") or order.get("id") or "") or None
+    return str(payload.get("order_id") or payload.get("id") or "") or None
+
+
+def _extract_market_ticker(payload: dict[str, Any]) -> str:
+    return str(payload.get("market_ticker", payload.get("ticker", "")) or "")
+
+
+def _extract_price_cents(payload: dict[str, Any]) -> int | None:
+    for key in ("price", "price_cents", "yes_price", "no_price"):
+        raw = payload.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value <= 1.0:
+            return int(round(value * 100.0))
+        return int(round(value))
+    return None
+
+
+def _extract_quantity(payload: dict[str, Any]) -> int:
+    for key in ("count", "count_fp", "quantity", "quantity_fp", "size", "size_fp"):
+        raw = payload.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            return int(round(float(raw)))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _coerce_fp_orderbook_levels(raw_levels: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(raw_levels, list):
+        return None
+    levels: list[dict[str, Any]] = []
+    for item in raw_levels:
+        if isinstance(item, dict):
+            levels.append(item)
+            continue
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            levels.append({"price": item[0], "count": item[1]})
+            continue
+    return levels
+
+
+def _side_order_levels(payload: dict[str, Any], side: str) -> list[dict[str, Any]]:
+    book = payload.get("orderbook", payload) if isinstance(payload, dict) else {}
+    if isinstance(payload, dict):
+        fp_book = payload.get("orderbook_fp")
+        if isinstance(fp_book, dict):
+            fp_levels = _coerce_fp_orderbook_levels(fp_book.get(f"{side}_dollars"))
+            if fp_levels is not None:
+                return fp_levels
+    candidate_keys = (
+        [side, f"{side}_book", f"{side}_orderbook", f"{side}_asks", f"{side}_levels"]
+        if side in {"yes", "no"}
+        else []
+    )
+    for key in candidate_keys:
+        value = book.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("asks", "sell_orders", "levels", "orders"):
+                nested = value.get(nested_key)
+                if isinstance(nested, list):
+                    return [item for item in nested if isinstance(item, dict)]
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    for nested_key in ("asks", "sell_orders", "orders"):
+        nested = book.get(nested_key)
+        if isinstance(nested, dict):
+            side_levels = nested.get(side)
+            if isinstance(side_levels, list):
+                return [item for item in side_levels if isinstance(item, dict)]
+    return []
+
+
+def _has_explicit_orderbook(payload: dict[str, Any], side: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    fp_book = payload.get("orderbook_fp")
+    if isinstance(fp_book, dict) and f"{side}_dollars" in fp_book:
+        return True
+    book = payload.get("orderbook", payload)
+    if isinstance(book, dict):
+        if side in book:
+            return True
+        for key in (f"{side}_book", f"{side}_orderbook", f"{side}_asks", f"{side}_levels"):
+            if key in book:
+                return True
+        for nested_key in ("asks", "sell_orders", "orders"):
+            nested = book.get(nested_key)
+            if isinstance(nested, dict) and side in nested:
+                return True
+    return False
+
+
+def _available_contracts_at_price(payload: dict[str, Any], *, side: str, limit_price_cents: int) -> int | None:
+    fp_book = payload.get("orderbook_fp") if isinstance(payload, dict) else None
+    if isinstance(fp_book, dict):
+        # Kalshi orderbook_fp exposes only bids. For entry fillability we need
+        # the reciprocal side because:
+        # - YES buy fills against NO bids at prices >= (100 - yes_limit)
+        # - NO buy fills against YES bids at prices >= (100 - no_limit)
+        reciprocal_side = "no" if side == "yes" else "yes"
+        reciprocal_levels = _coerce_fp_orderbook_levels(fp_book.get(f"{reciprocal_side}_dollars"))
+        if reciprocal_levels is not None:
+            if not reciprocal_levels:
+                return 0
+            reciprocal_min_bid_cents = max(100 - int(limit_price_cents), 0)
+            total = 0
+            usable_level_found = False
+            for level in reciprocal_levels:
+                price_cents = _extract_price_cents(level)
+                quantity = _extract_quantity(level)
+                if price_cents is None or quantity <= 0:
+                    continue
+                usable_level_found = True
+                if price_cents >= reciprocal_min_bid_cents:
+                    total += quantity
+            if not usable_level_found:
+                return None
+            return total
+
+    levels = _side_order_levels(payload, side)
+    if not levels:
+        if _has_explicit_orderbook(payload, side):
+            return 0
+        return None
+    total = 0
+    usable_level_found = False
+    for level in levels:
+        price_cents = _extract_price_cents(level)
+        quantity = _extract_quantity(level)
+        if price_cents is None or quantity <= 0:
+            continue
+        usable_level_found = True
+        if price_cents <= limit_price_cents:
+            total += quantity
+    if not usable_level_found:
+        return None
+    return total
+
+
+def _filled_contracts_from_fills(payload: dict[str, Any]) -> int | None:
+    fills = _extract_fills(payload)
+    if not fills:
+        return None
+    total = 0
+    saw_any = False
+    for fill in fills:
+        quantity = _extract_quantity(fill)
+        if quantity <= 0:
+            continue
+        total += quantity
+        saw_any = True
+    return total if saw_any else 0
+
+
+class LiveTrader:
+    def __init__(
+        self,
+        *,
+        store: PostgresStore,
+        client: KabotKalshiClient,
+        config: LiveTraderConfig,
+    ) -> None:
+        self.store = store
+        self.client = client
+        self.config = config
+        self.model = GBMThresholdModel(volatility_floor=config.gbm_volatility_floor)
+        self.local_positions: dict[str, Position] = {}
+        self.position_strategies: dict[str, str] = {}
+        self.reentry_states: dict[str, SignalBreakReentryState] = {}
+        self.pending_signal_breaks: dict[str, PendingSignalBreakState] = {}
+        self.signal_break_blocked_tickers: set[str] = set()
+        self.local_resting_entry_locks: dict[str, LocalRestingEntryLock] = {}
+        self.failed_entry_attempts: dict[str, int] = {}
+        self.failed_entry_blocked_until: dict[str, datetime] = {}
+        self.closed_trades: list[ClosedTrade] = []
+        self.submitted_trade_times: list[datetime] = []
+        self.consecutive_losses = 0
+        self.cooldown_until: datetime | None = None
+        # WebSocket feeds — started in run_forever()
+        self.spot_feed = CoinbaseSpotFeed()
+        auth_signer = getattr(client, "auth_signer", None)
+        self.ticker_feed = KalshiTickerFeed(auth_signer) if auth_signer is not None else None
+        self.fill_feed = KalshiFillFeed(auth_signer) if auth_signer is not None else None
+        self.state_store = ExecutionStateStore(series_ticker=config.series_ticker)
+        # Full REST market dicts keyed by ticker (metadata: expiry, threshold, etc.)
+        self._market_metadata: dict[str, dict[str, Any]] = {}
+        self._last_metadata_refresh: datetime | None = None
+        self.trace_writer = ExecutionTraceWriter(self.config.execution_trace_path)
+
+    def _strategy_rules(self) -> tuple[StrategyRule, ...]:
+        return _strategy_rules_with_max_tte(self.config.entry_max_tte_minutes)
+
+    def run_forever(self) -> None:
+        self._refresh_market_metadata()
+        self.spot_feed.start()
+        if self.ticker_feed is not None:
+            self.ticker_feed.start()
+        if self.fill_feed is not None:
+            self.fill_feed.start()
+        last_ticker_revision = self.ticker_feed.revision() if self.ticker_feed is not None else 0
+        last_spot_revision = self.spot_feed.revision()
+        last_heartbeat = datetime.min.replace(tzinfo=UTC)
+        while True:
+            now = datetime.now(UTC)
+            if (
+                self._last_metadata_refresh is None
+                or (now - self._last_metadata_refresh).total_seconds() >= self.config.metadata_refresh_seconds
+            ):
+                self._refresh_market_metadata()
+            should_run = False
+            if self.config.enable_execution_sessions:
+                current_ticker_revision = self.ticker_feed.revision() if self.ticker_feed is not None else 0
+                current_spot_revision = self.spot_feed.revision()
+                if current_ticker_revision > last_ticker_revision or current_spot_revision > last_spot_revision:
+                    should_run = True
+                if (now - last_heartbeat).total_seconds() >= max(float(self.config.execution_heartbeat_seconds), 0.1):
+                    should_run = True
+                if should_run:
+                    last_ticker_revision = current_ticker_revision
+                    last_spot_revision = current_spot_revision
+                    last_heartbeat = now
+                    result = self.run_once()
+                    print(self._format_cycle_log(result), flush=True)
+                time.sleep(max(float(self.config.event_loop_sleep_seconds), 0.01))
+                continue
+            result = self.run_once()
+            print(self._format_cycle_log(result), flush=True)
+            time.sleep(self.config.poll_seconds)
+
+    def run_once(self) -> dict[str, Any]:
+        observed_at = datetime.now(UTC)
+        strategy_rules = self._strategy_rules()
+        closed_now = self._reconcile_settled_positions(observed_at)
+        ws_spot, ws_spot_ts = self.spot_feed.get()
+        if ws_spot is not None and ws_spot_ts is not None:
+            spot_price, spot_timestamp = ws_spot, ws_spot_ts
+        else:
+            spot_price, spot_timestamp = self.client.fetch_spot_price()
+        if (observed_at - spot_timestamp).total_seconds() > self.config.max_spot_age_seconds:
+            return {
+                "observed_at": observed_at.isoformat(),
+                "active_profile": self.config.active_profile,
+                "series_ticker": self.config.series_ticker,
+                "status": "paused_stale_spot",
+                "spot_age_seconds": (observed_at - spot_timestamp).total_seconds(),
+                "closed_positions": [closed.__dict__ for closed in closed_now],
+                "reject_summary": {"stale_spot": 1},
+            }
+
+        if self.cooldown_until is not None and observed_at < self.cooldown_until:
+            return {
+                "observed_at": observed_at.isoformat(),
+                "active_profile": self.config.active_profile,
+                "series_ticker": self.config.series_ticker,
+                "status": "cooldown",
+                "cooldown_until": self.cooldown_until.isoformat(),
+                "closed_positions": [closed.__dict__ for closed in closed_now],
+                "reject_summary": {"cooldown": 1},
+            }
+
+        if self._daily_realized_pnl_cents(observed_at.date()) <= -abs(self.config.daily_loss_stop_cents):
+            return {
+                "observed_at": observed_at.isoformat(),
+                "active_profile": self.config.active_profile,
+                "series_ticker": self.config.series_ticker,
+                "status": "daily_loss_stop",
+                "daily_realized_pnl_cents": self._daily_realized_pnl_cents(observed_at.date()),
+                "closed_positions": [closed.__dict__ for closed in closed_now],
+                "reject_summary": {"daily_loss_stop": 1},
+            }
+
+        if self.config.max_trades_per_day > 0 and self._daily_trade_count(observed_at.date()) >= self.config.max_trades_per_day:
+            return {
+                "observed_at": observed_at.isoformat(),
+                "active_profile": self.config.active_profile,
+                "series_ticker": self.config.series_ticker,
+                "status": "max_trades_reached",
+                "daily_trade_count": self._daily_trade_count(observed_at.date()),
+                "closed_positions": [closed.__dict__ for closed in closed_now],
+                "reject_summary": {"max_trades_reached": 1},
+            }
+
+        snapshots = self._build_snapshots(spot_price=spot_price, observed_at=observed_at)
+        self.store.insert_market_snapshots(snapshots)
+
+        account_position_contracts = self._account_position_contracts()
+        resting_order_tickers = self._resting_buy_market_tickers()
+        self._sync_local_positions(
+            account_position_contracts=account_position_contracts,
+            resting_order_tickers=resting_order_tickers,
+            observed_at=observed_at,
+        )
+        local_position_contracts = {
+            ticker: position.contracts
+            for ticker, position in self.local_positions.items()
+            if position.status == "open"
+        }
+        external_position_tickers = {
+            ticker for ticker, contracts in account_position_contracts.items() if contracts > 0 and ticker not in local_position_contracts
+        }
+        permanently_blocked_tickers = set(self.signal_break_blocked_tickers)
+        local_open_tickers = set(local_position_contracts)
+        local_resting_entry_tickers = self._active_local_resting_entry_tickers(
+            observed_at=observed_at,
+            resting_order_tickers=set(resting_order_tickers),
+            account_position_contracts=account_position_contracts,
+            local_position_contracts=local_position_contracts,
+        )
+        resting_buy_tickers = set(resting_order_tickers) | local_resting_entry_tickers
+        open_tickers = local_open_tickers | external_position_tickers | resting_buy_tickers
+        failed_entry_blocked_tickers = self._blocked_failed_entry_tickers(observed_at)
+        active_strategy_counts = self._active_strategy_counts()
+        available_balance_cents: int | None = None
+        try:
+            balance_payload = self.client.get_balance()
+            available_balance_cents = _safe_int(balance_payload.get("balance"))
+        except Exception:
+            available_balance_cents = None
+        deployed_cents = self._local_open_notional_cents()
+        bankroll_cents = None
+        if available_balance_cents is not None:
+            bankroll_cents = available_balance_cents + deployed_cents
+        reject_summary: dict[str, int] = {}
+        sample_market: dict[str, Any] | None = None
+        if snapshots:
+            future_snapshots = [snapshot for snapshot in snapshots if snapshot.expiry > observed_at]
+            chosen_snapshot = min(
+                future_snapshots or snapshots,
+                key=lambda snapshot: max((snapshot.expiry - observed_at).total_seconds(), 0.0),
+            )
+            sample_market = self._sample_market_view(snapshot=chosen_snapshot)
+        fresh_snapshots = list(snapshots)
+        volatility = self._estimate_live_volatility(observed_at=observed_at)
+        signal_break_orders = self._reconcile_signal_break_positions(
+            observed_at=observed_at,
+            snapshots=fresh_snapshots,
+            volatility=volatility,
+        )
+        self._cancel_stale_resting_entry_orders(
+            observed_at=observed_at,
+            snapshots=fresh_snapshots,
+            volatility=volatility,
+        )
+        if signal_break_orders:
+            account_position_contracts = self._account_position_contracts()
+            resting_order_tickers = self._resting_buy_market_tickers()
+            self._sync_local_positions(
+                account_position_contracts=account_position_contracts,
+                resting_order_tickers=resting_order_tickers,
+                observed_at=observed_at,
+            )
+            local_position_contracts = {
+                ticker: position.contracts
+                for ticker, position in self.local_positions.items()
+                if position.status == "open"
+            }
+            external_position_tickers = {
+                ticker for ticker, contracts in account_position_contracts.items() if contracts > 0 and ticker not in local_position_contracts
+            }
+            open_tickers = set(local_position_contracts) | external_position_tickers | set(resting_order_tickers)
+            active_strategy_counts = self._active_strategy_counts()
+            permanently_blocked_tickers = set(self.signal_break_blocked_tickers)
+        candidates = select_entry_candidates(
+            fresh_snapshots,
+            blocked_markets=set(external_position_tickers)
+            | set(resting_order_tickers)
+            | set(failed_entry_blocked_tickers)
+            | permanently_blocked_tickers,
+            current_position_contracts=dict(local_position_contracts),
+            current_position_strategies=dict(self.position_strategies),
+            active_strategy_counts=active_strategy_counts,
+            open_market_count=len(open_tickers),
+            max_open_markets=self.config.max_open_markets,
+            max_strategy_open_counts=self.config.max_strategy_open_counts or {},
+            available_balance_cents=available_balance_cents,
+            bankroll_cents=bankroll_cents,
+            deployed_cents=deployed_cents,
+            distance_threshold_dollars=self.config.distance_threshold_dollars,
+            per_market_fraction=self.config.position_fraction_per_market,
+            max_total_deployed_fraction=self.config.max_total_deployed_fraction,
+            max_notional_per_market_cents=self.config.max_notional_per_market_cents,
+            max_contracts_per_order=self.config.max_contracts_per_order,
+            max_contracts_per_market=self.config.max_contracts_per_market,
+            min_market_volume=self.config.min_market_volume,
+            strategy_rules=strategy_rules,
+        )
+        gbm_filtered: list[StrategyCandidate] = []
+        for candidate in candidates:
+            if volatility is None:
+                _increment_reason(reject_summary, "gbm_vol_unavailable")
+                continue
+            estimate = self.model.estimate(candidate.snapshot, volatility=volatility)
+            market_probability = candidate.price_cents / 100.0
+            side_probability = estimate.probability if candidate.side == "yes" else (1.0 - estimate.probability)
+            edge = side_probability - market_probability
+            min_edge = self._required_gbm_edge(
+                strategy_name=candidate.strategy_name,
+                ask_cents=candidate.price_cents,
+            )
+            if edge < min_edge:
+                _increment_reason(reject_summary, "gbm_edge_below_threshold")
+                continue
+            gbm_filtered.append(
+                StrategyCandidate(
+                    strategy_name=candidate.strategy_name,
+                    confidence=candidate.confidence,
+                    snapshot=candidate.snapshot,
+                    side=candidate.side,
+                    price_cents=candidate.price_cents,
+                    contracts=candidate.contracts,
+                    gbm_probability=side_probability,
+                    gbm_edge=edge,
+                )
+            )
+        candidates = self._apply_reentry_rules(candidates=gbm_filtered, reject_summary=reject_summary)
+        selection_rejections = summarize_rejections(
+            fresh_snapshots,
+            blocked_markets=set(open_tickers) | set(failed_entry_blocked_tickers) | permanently_blocked_tickers,
+            blocked_reason_sets={
+                "has_local_position": local_open_tickers,
+                "has_external_position": set(external_position_tickers),
+                "has_resting_order": resting_buy_tickers,
+                "failed_entry_backoff": set(failed_entry_blocked_tickers),
+                "signal_break_locked": permanently_blocked_tickers,
+            },
+            active_strategy_counts=dict(active_strategy_counts),
+            open_market_count=len(open_tickers),
+            max_open_markets=self.config.max_open_markets,
+            max_strategy_open_counts=self.config.max_strategy_open_counts or {},
+            distance_threshold_dollars=self.config.distance_threshold_dollars,
+            min_market_volume=self.config.min_market_volume,
+            strategy_rules=strategy_rules,
+        )
+        for reason, count in selection_rejections.items():
+            reject_summary[reason] = reject_summary.get(reason, 0) + count
+
+        placed: list[dict[str, Any]] = []
+        for candidate in candidates:
+            order = self._submit_order(candidate)
+            placed.append(order)
+            filled_contracts = max(int(order.get("filled_contracts", 0) or 0), 0)
+            if filled_contracts > 0:
+                self._clear_failed_entry_attempts(candidate.snapshot.market_ticker)
+                self.local_resting_entry_locks.pop(candidate.snapshot.market_ticker, None)
+                self._register_successful_reentry(candidate)
+                self._trace_execution_event(
+                    {
+                        "event": "entry_filled",
+                        "market_ticker": candidate.snapshot.market_ticker,
+                        "side": candidate.side,
+                        "strategy_name": candidate.strategy_name,
+                        "price_cents": candidate.price_cents,
+                        "filled_contracts": filled_contracts,
+                        "gbm_edge": candidate.gbm_edge,
+                        "gbm_probability": candidate.gbm_probability,
+                        "observed_at": candidate.snapshot.observed_at,
+                    }
+                )
+                existing = self.local_positions.get(candidate.snapshot.market_ticker)
+                if existing is None:
+                    self.local_positions[candidate.snapshot.market_ticker] = Position(
+                        position_id=str(uuid4()),
+                        market_ticker=candidate.snapshot.market_ticker,
+                        side=candidate.side,  # type: ignore[arg-type]
+                        contracts=filled_contracts,
+                        entry_time=candidate.snapshot.observed_at,
+                        entry_price_cents=candidate.price_cents,
+                        expiry=candidate.snapshot.expiry,
+                    )
+                else:
+                    total_contracts = existing.contracts + filled_contracts
+                    weighted_entry = int(
+                        round(
+                            (
+                                existing.entry_price_cents * existing.contracts
+                                + candidate.price_cents * filled_contracts
+                            )
+                            / max(total_contracts, 1)
+                        )
+                    )
+                    existing.contracts = total_contracts
+                    existing.entry_price_cents = weighted_entry
+                    existing.expiry = candidate.snapshot.expiry
+                self.position_strategies[candidate.snapshot.market_ticker] = candidate.strategy_name
+            else:
+                order_status = str(order.get("status") or "")
+                if order_status not in {"resting", "open", "submitted", "pending"}:
+                    self._record_failed_entry_attempt(candidate.snapshot.market_ticker)
+            self.submitted_trade_times.append(observed_at)
+
+        return {
+            "observed_at": observed_at.isoformat(),
+            "active_profile": self.config.active_profile,
+            "series_ticker": self.config.series_ticker,
+            "spot_price": spot_price,
+            "spot_timestamp": spot_timestamp.isoformat(),
+            "snapshots_seen": len(snapshots),
+            "fresh_snapshots_seen": len(fresh_snapshots),
+            "active_markets": len(open_tickers),
+            "candidates": len(candidates),
+            "orders_placed": len(placed),
+            "placed_orders": placed,
+            "signal_break_orders": signal_break_orders,
+            "available_balance_cents": available_balance_cents,
+            "estimated_bankroll_cents": bankroll_cents,
+            "local_deployed_cents": deployed_cents,
+            "gbm_volatility": volatility,
+            "daily_realized_pnl_cents": self._daily_realized_pnl_cents(observed_at.date()),
+            "daily_trade_count": self._daily_trade_count(observed_at.date()),
+            "closed_positions": [closed.__dict__ for closed in closed_now],
+            "reject_summary": reject_summary,
+            "sample_market": sample_market,
+            "dry_run": self.config.dry_run,
+        }
+
+    @staticmethod
+    def _format_cycle_log(result: dict[str, Any]) -> str:
+        observed_at = str(result.get("observed_at", ""))
+        status = str(result.get("status", "ok"))
+        active_profile = str(result.get("active_profile", "baseline_live"))
+        series = str(result.get("series_ticker", ""))
+        spot_price = result.get("spot_price")
+        if isinstance(spot_price, (int, float)):
+            spot_text = f"{float(spot_price):.2f}"
+        else:
+            spot_text = "na"
+        snapshots_seen = int(result.get("snapshots_seen", 0) or 0)
+        fresh_seen = int(result.get("fresh_snapshots_seen", 0) or 0)
+        active_markets = int(result.get("active_markets", 0) or 0)
+        candidates = int(result.get("candidates", 0) or 0)
+        orders_placed = int(result.get("orders_placed", 0) or 0)
+        available_balance_cents = _safe_int(result.get("available_balance_cents"))
+        estimated_bankroll_cents = _safe_int(result.get("estimated_bankroll_cents"))
+        local_deployed_cents = _safe_int(result.get("local_deployed_cents"))
+        gbm_volatility = result.get("gbm_volatility")
+        daily_pnl = int(result.get("daily_realized_pnl_cents", 0) or 0)
+        daily_trades = int(result.get("daily_trade_count", 0) or 0)
+        signal_break_orders = result.get("signal_break_orders")
+        signal_exit_count = len(signal_break_orders) if isinstance(signal_break_orders, list) else 0
+        reject_summary = result.get("reject_summary")
+        reject_text = ""
+        if isinstance(reject_summary, dict) and reject_summary:
+            reject_text = " rejects=" + ",".join(
+                f"{key}:{value}" for key, value in sorted(reject_summary.items())
+            )
+        sample_market = result.get("sample_market")
+        sample_text = ""
+        if isinstance(sample_market, dict) and sample_market:
+            sample_bits = []
+            for key in ("market_ticker", "volume", "open_interest", "yes_bid_c", "yes_ask_c", "no_bid_c", "no_ask_c", "threshold", "spot_price", "tte_s"):
+                if key in sample_market:
+                    sample_bits.append(f"{key}={sample_market[key]}")
+            if sample_bits:
+                sample_text = " sample[" + " ".join(sample_bits) + "]"
+        order_text = ""
+        placed_orders = result.get("placed_orders")
+        if isinstance(placed_orders, list) and placed_orders:
+            latest_order = placed_orders[-1]
+            if isinstance(latest_order, dict):
+                order_bits = []
+                for key in (
+                    "side",
+                    "status",
+                    "strategy_name",
+                    "confidence",
+                    "gbm_edge",
+                    "signal_price_cents",
+                    "execution_price_cents",
+                    "filled_contracts",
+                    "exchange_filled_contracts",
+                    "orderbook_available_contracts",
+                ):
+                    if key in latest_order:
+                        order_bits.append(f"{key}={latest_order[key]}")
+                if order_bits:
+                    order_text = " order[" + " ".join(order_bits) + "]"
+        return (
+            f"{observed_at} profile={active_profile} series={series} status={status} "
+            f"spot={spot_text} snapshots={snapshots_seen} fresh={fresh_seen} "
+            f"active={active_markets} candidates={candidates} orders={orders_placed} "
+            f"signal_exits={signal_exit_count} "
+            f"balance_cents={available_balance_cents if available_balance_cents is not None else 'na'} "
+            f"bankroll_cents={estimated_bankroll_cents if estimated_bankroll_cents is not None else 'na'} "
+            f"deployed_cents={local_deployed_cents if local_deployed_cents is not None else 'na'} "
+            f"gbm_vol={round(float(gbm_volatility), 4) if isinstance(gbm_volatility, (int, float)) else 'na'} "
+            f"day_pnl_cents={daily_pnl} day_trades={daily_trades}{reject_text}{sample_text}{order_text}"
+        )
+
+    def _refresh_market_metadata(self) -> None:
+        """Fetch current open markets via REST and subscribe new tickers to the WS feed."""
+        observed_at = datetime.now(UTC)
+        try:
+            raw_markets = self.client.list_markets(series_ticker=self.config.series_ticker, status="open")
+        except Exception:
+            return
+        self.state_store.update_metadata(raw_markets=raw_markets, observed_at=observed_at)
+        live_tickers: set[str] = set()
+        new_tickers: list[str] = []
+        for raw in raw_markets:
+            ticker = str(raw.get("ticker") or raw.get("market_ticker") or "")
+            if not ticker:
+                continue
+            live_tickers.add(ticker)
+            self._market_metadata[ticker] = {**raw, "series_ticker": self.config.series_ticker}
+            if ticker not in (self.ticker_feed._subscribed if self.ticker_feed is not None else set()):
+                new_tickers.append(ticker)
+        for ticker in list(self._market_metadata):
+            if ticker not in live_tickers:
+                self._market_metadata.pop(ticker, None)
+                self.reentry_states.pop(ticker, None)
+                self.pending_signal_breaks.pop(ticker, None)
+                self.signal_break_blocked_tickers.discard(ticker)
+                self.local_resting_entry_locks.pop(ticker, None)
+                self.failed_entry_attempts.pop(ticker, None)
+                self.failed_entry_blocked_until.pop(ticker, None)
+        if new_tickers and self.ticker_feed is not None:
+            self.ticker_feed.subscribe(new_tickers)
+        self._last_metadata_refresh = datetime.now(UTC)
+
+    def _build_snapshots(self, *, spot_price: float, observed_at: datetime) -> list[MarketSnapshot]:
+        """Merge WS price updates with REST metadata to build MarketSnapshots."""
+        ws_prices = self.ticker_feed.snapshot() if self.ticker_feed is not None else {}
+        return self.state_store.build_snapshots(
+            ws_snapshot=ws_prices,
+            spot_price=spot_price,
+            observed_at=observed_at,
+            max_quote_age_seconds=self.config.max_ws_quote_age_seconds,
+        )
+
+    def _snapshot_for_ticker(self, *, ticker: str, spot_price: float, observed_at: datetime) -> MarketSnapshot | None:
+        ws_prices = self.ticker_feed.get_prices(ticker) if self.ticker_feed is not None else None
+        return self.state_store.build_snapshot(
+            ticker=ticker,
+            ws_prices=ws_prices,
+            spot_price=spot_price,
+            observed_at=observed_at,
+            max_quote_age_seconds=self.config.max_ws_quote_age_seconds,
+        )
+
+    def _trace_execution_event(self, event: dict[str, Any]) -> None:
+        payload = {
+            "ts": datetime.now(UTC),
+            "profile": self.config.active_profile,
+            **event,
+        }
+        self.trace_writer.write(payload)
+
+    def _blocked_failed_entry_tickers(self, observed_at: datetime) -> set[str]:
+        blocked: set[str] = set()
+        for ticker, until in list(self.failed_entry_blocked_until.items()):
+            if observed_at >= until:
+                self.failed_entry_blocked_until.pop(ticker, None)
+                self.failed_entry_attempts.pop(ticker, None)
+                continue
+            blocked.add(ticker)
+        return blocked
+
+    def _active_local_resting_entry_tickers(
+        self,
+        *,
+        observed_at: datetime,
+        resting_order_tickers: set[str],
+        account_position_contracts: dict[str, int],
+        local_position_contracts: dict[str, int],
+    ) -> set[str]:
+        active: set[str] = set()
+        grace_seconds = max(float(self.config.local_resting_entry_lock_seconds), 0.0)
+        for ticker, lock in list(self.local_resting_entry_locks.items()):
+            if (
+                ticker in resting_order_tickers
+                or int(account_position_contracts.get(ticker, 0)) > 0
+                or int(local_position_contracts.get(ticker, 0)) > 0
+            ):
+                active.add(ticker)
+                continue
+            age_seconds = (observed_at - lock.created_at).total_seconds()
+            if age_seconds <= grace_seconds:
+                active.add(ticker)
+                continue
+            self.local_resting_entry_locks.pop(ticker, None)
+        return active
+
+    def _cancel_stale_resting_entry_orders(
+        self,
+        *,
+        observed_at: datetime,
+        snapshots: list[MarketSnapshot],
+        volatility: float | None,
+    ) -> None:
+        """Cancel resting GTC entry orders whose signal has broken since posting."""
+        if self.config.entry_time_in_force == "immediate_or_cancel":
+            return
+        if not self.local_resting_entry_locks:
+            return
+        snapshots_by_ticker = {s.market_ticker: s for s in snapshots}
+        for ticker, lock in list(self.local_resting_entry_locks.items()):
+            if not lock.side or not lock.strategy_name:
+                continue
+            snapshot = snapshots_by_ticker.get(ticker)
+            if snapshot is None:
+                continue
+            if snapshot.threshold is None:
+                continue
+            dist = self.config.distance_threshold_dollars
+            # Signal broken: spot no longer satisfies direction requirement
+            signal_broken = False
+            if lock.side == "yes" and snapshot.spot_price < snapshot.threshold + dist:
+                signal_broken = True
+            elif lock.side == "no" and snapshot.spot_price > snapshot.threshold - dist:
+                signal_broken = True
+            # Also check GBM edge
+            if not signal_broken and volatility is not None:
+                ask_cents, _ = _side_prices(snapshot, lock.side)
+                if ask_cents is not None:
+                    estimate = self.model.estimate(snapshot, volatility=volatility)
+                    side_prob = estimate.probability if lock.side == "yes" else (1.0 - estimate.probability)
+                    edge = side_prob - ask_cents / 100.0
+                    if edge < self._required_gbm_edge(strategy_name=lock.strategy_name, ask_cents=ask_cents):
+                        signal_broken = True
+            if not signal_broken:
+                continue
+            # Resolve order_id: fill_feed first, then REST
+            order_id: str | None = None
+            if self.fill_feed is not None:
+                order_id = self.fill_feed.get_resting_order_id(ticker)
+            if not order_id:
+                try:
+                    orders_payload = self.client.list_orders(status="resting")
+                    for order in _extract_orders(orders_payload):
+                        if _extract_market_ticker(order) == ticker and str(order.get("action", "")).lower() == "buy":
+                            order_id = _extract_order_id({"order": order})
+                            break
+                except Exception:
+                    pass
+            if order_id:
+                try:
+                    self.client.cancel_order(order_id)
+                    self._trace_execution_event({
+                        "event": "resting_entry_canceled_signal_broke",
+                        "market_ticker": ticker,
+                        "order_id": order_id,
+                    })
+                except Exception:
+                    pass
+            if self.fill_feed is not None:
+                self.fill_feed.deregister_order(ticker)
+            self.local_resting_entry_locks.pop(ticker, None)
+
+    def _record_failed_entry_attempt(self, ticker: str) -> None:
+        count = self.failed_entry_attempts.get(ticker, 0) + 1
+        self.failed_entry_attempts[ticker] = count
+        threshold = max(int(self.config.failed_entry_backoff_after_attempts), 1)
+        if count >= threshold:
+            self.failed_entry_blocked_until[ticker] = datetime.now(UTC) + timedelta(
+                seconds=max(float(self.config.failed_entry_backoff_seconds), 0.0)
+            )
+            self._trace_execution_event(
+                {
+                    "event": "failed_entry_backoff_started",
+                    "market_ticker": ticker,
+                    "failed_entry_attempts": count,
+                    "blocked_until": self.failed_entry_blocked_until[ticker],
+                }
+            )
+
+    def _clear_failed_entry_attempts(self, ticker: str) -> None:
+        self.failed_entry_attempts.pop(ticker, None)
+        self.failed_entry_blocked_until.pop(ticker, None)
+
+    def _apply_reentry_rules(
+        self,
+        *,
+        candidates: list[StrategyCandidate],
+        reject_summary: dict[str, int],
+    ) -> list[StrategyCandidate]:
+        if not self.config.enable_signal_break_reentry:
+            return candidates
+        filtered: list[StrategyCandidate] = []
+        for candidate in candidates:
+            state = self.reentry_states.get(candidate.snapshot.market_ticker)
+            if state is None:
+                filtered.append(candidate)
+                continue
+            if candidate.side != state.exit_side:
+                filtered.append(candidate)
+                continue
+            if state.successful_reentries >= int(self.config.reentry_max_per_market):
+                _increment_reason(reject_summary, "reentry_cap_reached")
+                continue
+            required_edge = self._required_gbm_edge(
+                strategy_name=candidate.strategy_name,
+                ask_cents=candidate.price_cents,
+            ) + float(self.config.reentry_edge_premium)
+            if (candidate.gbm_edge or float("-inf")) < required_edge:
+                _increment_reason(reject_summary, "reentry_edge_too_weak")
+                continue
+            if candidate.price_cents > (state.exit_reference_price_cents - int(self.config.reentry_min_price_improvement_cents)):
+                _increment_reason(reject_summary, "reentry_no_fresh_lag")
+                continue
+            contracts = candidate.contracts if candidate.confidence == "high" else min(candidate.contracts, 1)
+            if contracts <= 0:
+                _increment_reason(reject_summary, "reentry_size_zero")
+                continue
+            filtered.append(
+                StrategyCandidate(
+                    strategy_name=candidate.strategy_name,
+                    confidence=candidate.confidence,
+                    snapshot=candidate.snapshot,
+                    side=candidate.side,
+                    price_cents=candidate.price_cents,
+                    contracts=contracts,
+                    gbm_probability=candidate.gbm_probability,
+                    gbm_edge=candidate.gbm_edge,
+                )
+            )
+        return filtered
+
+    def _register_successful_reentry(self, candidate: StrategyCandidate) -> None:
+        state = self.reentry_states.get(candidate.snapshot.market_ticker)
+        if state is None:
+            return
+        if candidate.side != state.exit_side:
+            self.reentry_states.pop(candidate.snapshot.market_ticker, None)
+            return
+        state.successful_reentries += 1
+        self._trace_execution_event(
+            {
+                "event": "reentry_filled",
+                "market_ticker": candidate.snapshot.market_ticker,
+                "side": candidate.side,
+                "strategy_name": candidate.strategy_name,
+                "price_cents": candidate.price_cents,
+                "successful_reentries": state.successful_reentries,
+            }
+        )
+
+    def _latest_spot_price(self, fallback_spot_price: float) -> float:
+        ws_spot, _ws_ts = self.spot_feed.get()
+        if ws_spot is None:
+            return fallback_spot_price
+        return float(ws_spot)
+
+    def _reconcile_signal_break_positions(
+        self,
+        *,
+        observed_at: datetime,
+        snapshots: list[MarketSnapshot],
+        volatility: float | None,
+    ) -> list[dict[str, Any]]:
+        if not self.config.enable_signal_break_exit:
+            return []
+        snapshots_by_ticker = {snapshot.market_ticker: snapshot for snapshot in snapshots}
+        exits: list[dict[str, Any]] = []
+        for market_ticker, position in list(self.local_positions.items()):
+            if position.status != "open" or position.contracts <= 0:
+                continue
+            snapshot = snapshots_by_ticker.get(market_ticker)
+            if snapshot is None or snapshot.expiry <= observed_at:
+                self.pending_signal_breaks.pop(market_ticker, None)
+                continue
+            strategy_name = self.position_strategies.get(market_ticker, "unknown")
+            exit_reason = self._signal_break_reason(
+                position=position,
+                strategy_name=strategy_name,
+                snapshot=snapshot,
+                volatility=volatility,
+            )
+            if exit_reason is None:
+                self.pending_signal_breaks.pop(market_ticker, None)
+                continue
+            if exit_reason == "hard_stop_loss":
+                self.pending_signal_breaks.pop(market_ticker, None)
+                order = self._submit_exit_order(position=position, snapshot=snapshot, reason=exit_reason)
+                exits.append(order)
+                filled_contracts = max(int(order.get("filled_contracts", 0) or 0), 0)
+                if filled_contracts <= 0:
+                    continue
+                exit_price_cents = _safe_int(order.get("execution_price_cents"))
+                if exit_price_cents is None:
+                    continue
+                exit_reference_price_cents = _probability_to_cents(
+                    snapshot.yes_bid if position.side == "yes" else snapshot.no_bid
+                )
+                if exit_reference_price_cents is None:
+                    exit_reference_price_cents = exit_price_cents
+                realized_total_cents = int((exit_price_cents - position.entry_price_cents) * filled_contracts)
+                closed = ClosedTrade(
+                    market_ticker=market_ticker,
+                    strategy_name=f"{strategy_name}:signal_break",
+                    closed_at=observed_at,
+                    realized_pnl_cents=realized_total_cents,
+                )
+                self.closed_trades.append(closed)
+                self.reentry_states[market_ticker] = SignalBreakReentryState(
+                    market_ticker=market_ticker,
+                    exited_at=observed_at,
+                    exit_side=position.side,
+                    exit_strategy_name=strategy_name,
+                    exit_reference_price_cents=exit_reference_price_cents,
+                    exit_execution_price_cents=exit_price_cents,
+                )
+                self._trace_execution_event(
+                    {
+                        "event": "signal_break_exit_recorded",
+                        "market_ticker": market_ticker,
+                        "side": position.side,
+                        "strategy_name": strategy_name,
+                        "exit_reference_price_cents": exit_reference_price_cents,
+                        "exit_price_cents": exit_price_cents,
+                    }
+                )
+                self.signal_break_blocked_tickers.add(market_ticker)
+                remaining_contracts = max(position.contracts - filled_contracts, 0)
+                if remaining_contracts <= 0:
+                    del self.local_positions[market_ticker]
+                    self.position_strategies.pop(market_ticker, None)
+                else:
+                    position.contracts = remaining_contracts
+                continue
+            pending_state = self.pending_signal_breaks.get(market_ticker)
+            required_cycles = int(self.config.signal_break_confirmation_cycles)
+            if exit_reason == "price_stop_loss":
+                required_cycles = int(self.config.price_stop_confirm_cycles)
+            if pending_state is None or pending_state.reason != exit_reason:
+                self.pending_signal_breaks[market_ticker] = PendingSignalBreakState(reason=exit_reason, count=1)
+                if max(required_cycles, 1) <= 1:
+                    pending_state = self.pending_signal_breaks[market_ticker]
+                else:
+                    continue
+            else:
+                pending_state.count += 1
+            if pending_state.count < max(required_cycles, 1):
+                continue
+            order = self._submit_exit_order(position=position, snapshot=snapshot, reason=exit_reason)
+            exits.append(order)
+            filled_contracts = max(int(order.get("filled_contracts", 0) or 0), 0)
+            if filled_contracts <= 0:
+                continue
+            exit_price_cents = _safe_int(order.get("execution_price_cents"))
+            if exit_price_cents is None:
+                continue
+            exit_reference_price_cents = _probability_to_cents(snapshot.yes_bid if position.side == "yes" else snapshot.no_bid)
+            if exit_reference_price_cents is None:
+                exit_reference_price_cents = exit_price_cents
+            realized_total_cents = int((exit_price_cents - position.entry_price_cents) * filled_contracts)
+            closed = ClosedTrade(
+                market_ticker=market_ticker,
+                strategy_name=f"{strategy_name}:signal_break",
+                closed_at=observed_at,
+                realized_pnl_cents=realized_total_cents,
+            )
+            self.closed_trades.append(closed)
+            self.reentry_states[market_ticker] = SignalBreakReentryState(
+                market_ticker=market_ticker,
+                exited_at=observed_at,
+                exit_side=position.side,
+                exit_strategy_name=strategy_name,
+                exit_reference_price_cents=exit_reference_price_cents,
+                exit_execution_price_cents=exit_price_cents,
+            )
+            self._trace_execution_event(
+                {
+                    "event": "signal_break_exit_recorded",
+                    "market_ticker": market_ticker,
+                    "side": position.side,
+                    "strategy_name": strategy_name,
+                    "exit_reference_price_cents": exit_reference_price_cents,
+                    "exit_price_cents": exit_price_cents,
+                }
+            )
+            self.signal_break_blocked_tickers.add(market_ticker)
+            remaining_contracts = max(position.contracts - filled_contracts, 0)
+            self.pending_signal_breaks.pop(market_ticker, None)
+            if remaining_contracts <= 0:
+                del self.local_positions[market_ticker]
+                self.position_strategies.pop(market_ticker, None)
+            else:
+                position.contracts = remaining_contracts
+        return exits
+
+    def _signal_break_reason(
+        self,
+        *,
+        position: Position,
+        strategy_name: str,
+        snapshot: MarketSnapshot,
+        volatility: float | None,
+    ) -> str | None:
+        if snapshot.contract_type != "threshold" or snapshot.threshold is None:
+            return None
+        exit_distance = float(self.config.exit_distance_threshold_dollars)
+        if position.side == "yes" and snapshot.spot_price < (snapshot.threshold + exit_distance):
+            return "spot_below_yes_threshold"
+        if position.side == "no" and snapshot.spot_price > (snapshot.threshold - exit_distance):
+            return "spot_above_no_threshold"
+        bid_cents = _probability_to_cents(snapshot.yes_bid if position.side == "yes" else snapshot.no_bid)
+        if bid_cents is not None:
+            loss_cents = max(int(position.entry_price_cents - bid_cents), 0)
+            hard_stop_cents = int(self.config.hard_stop_cents)
+            if hard_stop_cents > 0 and loss_cents >= hard_stop_cents:
+                return "hard_stop_loss"
+            price_stop_cents = int(self.config.price_stop_cents)
+            if price_stop_cents > 0:
+                grace_seconds = max(int(self.config.price_stop_grace_seconds), 0)
+                age_seconds = max(int((snapshot.observed_at - position.entry_time).total_seconds()), 0)
+                if age_seconds >= grace_seconds and loss_cents >= price_stop_cents:
+                    return "price_stop_loss"
+        if volatility is None:
+            return None
+        if bid_cents is None:
+            return None
+        estimate = self.model.estimate(snapshot, volatility=volatility)
+        side_probability = estimate.probability if position.side == "yes" else (1.0 - estimate.probability)
+        current_edge = side_probability - (bid_cents / 100.0)
+        if current_edge < float(self.config.exit_negative_edge_threshold):
+            return "gbm_edge_negative"
+        return None
+
+    def _submit_exit_order(self, *, position: Position, snapshot: MarketSnapshot, reason: str) -> dict[str, Any]:
+        bid_cents = _probability_to_cents(snapshot.yes_bid if position.side == "yes" else snapshot.no_bid)
+        if bid_cents is None:
+            return {
+                "status": "missing_exit_bid",
+                "market_ticker": position.market_ticker,
+                "reason": reason,
+                "filled_contracts": 0,
+            }
+        execution_price_cents = max(bid_cents - max(int(self.config.exit_cross_cents), 0), 1)
+        payload = {
+            "ticker": position.market_ticker,
+            "action": "sell",
+            "side": position.side,
+            "count": int(position.contracts),
+            "type": "limit",
+            "yes_price": execution_price_cents if position.side == "yes" else None,
+            "no_price": execution_price_cents if position.side == "no" else None,
+            "client_order_id": f"kabot-exit-{position.market_ticker}-{int(snapshot.observed_at.timestamp())}",
+            "time_in_force": self.config.exit_time_in_force,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        if self.config.dry_run:
+            return {
+                "status": "dry_run",
+                "market_ticker": position.market_ticker,
+                "reason": reason,
+                "execution_price_cents": execution_price_cents,
+                "filled_contracts": 0,
+                "payload": payload,
+            }
+        response = self.client.create_order(payload)
+        response_order = response.get("order", response) if isinstance(response, dict) else {}
+        order_status = _extract_order_status(response_order if isinstance(response_order, dict) else {})
+        order_id = _extract_order_id(response)
+        filled_contracts = _extract_fill_count(response_order if isinstance(response_order, dict) else {})
+        exchange_filled_contracts: int | None = None
+        if order_id:
+            try:
+                fills_response = self.client.get_fills(order_id=order_id, ticker=position.market_ticker)
+                exchange_filled_contracts = _filled_contracts_from_fills(fills_response)
+            except Exception:
+                exchange_filled_contracts = None
+        if exchange_filled_contracts is not None:
+            filled_contracts = exchange_filled_contracts
+        return {
+            "status": order_status or "submitted",
+            "market_ticker": position.market_ticker,
+            "reason": reason,
+            "execution_price_cents": execution_price_cents,
+            "filled_contracts": max(int(filled_contracts), 0),
+            "exchange_filled_contracts": exchange_filled_contracts,
+            "payload": payload,
+            "response": response,
+        }
+
+    def _reconcile_settled_positions(self, observed_at: datetime) -> list[ClosedTrade]:
+        closed_now: list[ClosedTrade] = []
+        for market_ticker, position in list(self.local_positions.items()):
+            if position.status != "open" or position.expiry is None or position.expiry > observed_at:
+                continue
+            try:
+                payload = self.client.get_market(market_ticker)
+            except Exception:
+                continue
+            market = payload.get("market") if isinstance(payload.get("market"), dict) else payload
+            settlement_price = self._extract_settlement_price(market)
+            threshold = self._extract_threshold(market)
+            if settlement_price is None or threshold is None:
+                continue
+            exit_price_cents = 100 if ((position.side == "yes" and settlement_price >= threshold) or (position.side == "no" and settlement_price < threshold)) else 0
+            pnl_cents = int((exit_price_cents - position.entry_price_cents) * position.contracts)
+            strategy_name = self.position_strategies.get(market_ticker, "unknown")
+            closed = ClosedTrade(
+                market_ticker=market_ticker,
+                strategy_name=strategy_name,
+                closed_at=observed_at,
+                realized_pnl_cents=pnl_cents,
+            )
+            closed_now.append(closed)
+            self.closed_trades.append(closed)
+            del self.local_positions[market_ticker]
+            self.position_strategies.pop(market_ticker, None)
+            self.reentry_states.pop(market_ticker, None)
+            self.pending_signal_breaks.pop(market_ticker, None)
+            self.signal_break_blocked_tickers.discard(market_ticker)
+            if pnl_cents < 0:
+                self.consecutive_losses += 1
+                if self.consecutive_losses >= self.config.cooldown_loss_streak:
+                    self.cooldown_until = observed_at + timedelta(minutes=self.config.cooldown_minutes)
+            else:
+                self.consecutive_losses = 0
+        return closed_now
+
+    def _daily_realized_pnl_cents(self, day) -> int:
+        return int(sum(trade.realized_pnl_cents for trade in self.closed_trades if trade.closed_at.date() == day))
+
+    def _daily_trade_count(self, day) -> int:
+        return int(sum(1 for trade_time in self.submitted_trade_times if trade_time.date() == day))
+
+    def _local_open_notional_cents(self) -> int:
+        return int(
+            sum(
+                position.entry_price_cents * position.contracts
+                for position in self.local_positions.values()
+                if position.status == "open"
+            )
+        )
+
+    def _active_strategy_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for market_ticker, position in self.local_positions.items():
+            if position.status != "open":
+                continue
+            strategy_name = self.position_strategies.get(market_ticker, "unknown")
+            counts[strategy_name] = counts.get(strategy_name, 0) + 1
+        return counts
+
+    def _gbm_min_edge_for_strategy(self, strategy_name: str) -> float:
+        if strategy_name in {"yes_continuation_wide", "no_continuation_wide"}:
+            return float(self.config.gbm_min_edge_wide_yes)
+        return float(self.config.gbm_min_edge_mid)
+
+    def _required_gbm_edge(self, *, strategy_name: str, ask_cents: int) -> float:
+        base_edge = self._gbm_min_edge_for_strategy(strategy_name)
+        if ask_cents > SOFT_ENTRY_CAP_CENTS:
+            return base_edge + EXPENSIVE_ENTRY_EDGE_PREMIUM
+        return base_edge
+
+    @staticmethod
+    def _extract_settlement_price(market: dict[str, Any]) -> float | None:
+        for key in ("expiration_value", "settlement_price", "settlement_value", "final_price"):
+            raw = market.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_threshold(market: dict[str, Any]) -> float | None:
+        for key in ("threshold", "floor_strike", "strike"):
+            raw = market.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _sample_market_view(*, snapshot: MarketSnapshot) -> dict[str, Any]:
+        yes_ask_c, yes_bid_c = _probability_to_cents(snapshot.yes_ask), _probability_to_cents(snapshot.yes_bid)
+        no_ask_c, no_bid_c = _probability_to_cents(snapshot.no_ask), _probability_to_cents(snapshot.no_bid)
+        return {
+            "market_ticker": snapshot.market_ticker,
+            "volume": round(float(snapshot.volume), 2) if snapshot.volume is not None else None,
+            "open_interest": round(float(snapshot.open_interest), 2) if snapshot.open_interest is not None else None,
+            "yes_bid_c": yes_bid_c,
+            "yes_ask_c": yes_ask_c,
+            "no_bid_c": no_bid_c,
+            "no_ask_c": no_ask_c,
+            "threshold": round(float(snapshot.threshold), 2) if snapshot.threshold is not None else None,
+            "spot_price": round(float(snapshot.spot_price), 2),
+            "tte_s": max(int((snapshot.expiry - snapshot.observed_at).total_seconds()), 0),
+        }
+
+    def _estimate_live_volatility(self, *, observed_at: datetime) -> float | None:
+        lookback_start = observed_at - timedelta(minutes=self.config.gbm_lookback_minutes)
+        history = self.store.load_market_snapshots(
+            series_ticker=self.config.series_ticker,
+            observed_from=lookback_start,
+            observed_to=observed_at,
+        )
+        if history.empty or "observed_at" not in history.columns or "spot_price" not in history.columns:
+            return None
+        spot = (
+            history[["observed_at", "spot_price"]]
+            .dropna(subset=["observed_at", "spot_price"])
+            .drop_duplicates(subset=["observed_at"])
+            .sort_values("observed_at")
+        )
+        if len(spot) < self.config.gbm_min_points:
+            return None
+        price = spot["spot_price"].astype(float).to_numpy()
+        times = pd.to_datetime(spot["observed_at"], utc=True)
+        log_returns = np.diff(np.log(np.clip(price, 1e-12, None)))
+        if len(log_returns) < max(self.config.gbm_min_points - 1, 2):
+            return None
+        deltas = np.diff(times.astype("int64")) / 1_000_000_000.0
+        positive_deltas = deltas[deltas > 0]
+        if len(positive_deltas) == 0:
+            return None
+        avg_dt_seconds = float(np.median(positive_deltas))
+        if avg_dt_seconds <= 0:
+            return None
+        annualization = math.sqrt(31_536_000.0 / avg_dt_seconds)
+        sigma = float(np.std(log_returns, ddof=1)) * annualization
+        if not math.isfinite(sigma):
+            return None
+        return max(sigma, self.config.gbm_volatility_floor)
+
+    def _account_position_contracts(self) -> dict[str, int]:
+        positions_by_ticker: dict[str, int] = {}
+        try:
+            positions_payload = self.client.get_positions()
+            for position in _extract_positions(positions_payload):
+                ticker = _extract_market_ticker(position)
+                contracts = int(round(abs(_extract_position_count(position))))
+                if ticker and contracts > 0:
+                    positions_by_ticker[ticker] = contracts
+        except Exception:
+            pass
+        return positions_by_ticker
+
+    def _resting_buy_market_tickers(self) -> set[str]:
+        # Use the WebSocket fill-feed cache when healthy — avoids a REST round-trip
+        # every poll cycle.  Fall back to REST if the feed has not yet connected.
+        if self.fill_feed is not None:
+            ws_result = self.fill_feed.get_resting_tickers()
+            if ws_result is not None:
+                return ws_result
+
+        active: set[str] = set()
+        try:
+            orders_payload = self.client.list_orders(status="resting")
+            for order in _extract_orders(orders_payload):
+                ticker = _extract_market_ticker(order)
+                status = _extract_order_status(order)
+                action = str(order.get("action", "") or "").lower()
+                if ticker and action == "buy" and status in {"resting", "open", "submitted", "pending"}:
+                    active.add(ticker)
+        except Exception:
+            pass
+
+        return active
+
+    def _sync_local_positions(
+        self,
+        *,
+        account_position_contracts: dict[str, int],
+        resting_order_tickers: set[str],
+        observed_at: datetime,
+    ) -> None:
+        for market_ticker, position in list(self.local_positions.items()):
+            if position.status != "open":
+                continue
+            if position.expiry is not None and position.expiry <= observed_at:
+                continue
+            account_contracts = int(account_position_contracts.get(market_ticker, 0))
+            if account_contracts > 0:
+                position.contracts = account_contracts
+                self.local_resting_entry_locks.pop(market_ticker, None)
+                continue
+            if market_ticker not in resting_order_tickers:
+                del self.local_positions[market_ticker]
+                self.position_strategies.pop(market_ticker, None)
+                self.local_resting_entry_locks.pop(market_ticker, None)
+        # Promote resting-entry locks into local positions once the account shows fills.
+        for market_ticker, contracts in account_position_contracts.items():
+            if contracts <= 0:
+                continue
+            if market_ticker in self.local_positions:
+                continue
+            lock = self.local_resting_entry_locks.get(market_ticker)
+            if lock is None or lock.price_cents is None:
+                continue
+            self.local_positions[market_ticker] = Position(
+                position_id=str(uuid4()),
+                market_ticker=market_ticker,
+                side=lock.side,  # type: ignore[arg-type]
+                contracts=int(contracts),
+                entry_time=lock.observed_at or observed_at,
+                entry_price_cents=int(lock.price_cents),
+            )
+            self.position_strategies[market_ticker] = lock.strategy_name
+            self.local_resting_entry_locks.pop(market_ticker, None)
+            self._trace_execution_event(
+                {
+                    "event": "entry_filled",
+                    "market_ticker": market_ticker,
+                    "side": lock.side,
+                    "strategy_name": lock.strategy_name,
+                    "price_cents": int(lock.price_cents),
+                    "filled_contracts": int(contracts),
+                    "gbm_edge": lock.gbm_edge,
+                    "gbm_probability": lock.gbm_probability,
+                    "observed_at": lock.observed_at or observed_at,
+                }
+            )
+
+    def _submit_order_via_execution_session(self, candidate: StrategyCandidate) -> dict[str, Any]:
+        attempts: list[dict[str, Any]] = []
+        current_candidate = candidate
+        total_filled_contracts = 0
+        max_attempts = max(int(self.config.execution_session_attempts), 1)
+        last_response: dict[str, Any] | None = None
+        last_payload: dict[str, Any] | None = None
+        last_status = "submitted"
+        last_execution_price_cents = min(candidate.price_cents + max(self.config.execution_cross_cents, 0), 99)
+        self._trace_execution_event(
+            {
+                "event": "execution_session_start",
+                "market_ticker": candidate.snapshot.market_ticker,
+                "side": candidate.side,
+                "strategy_name": candidate.strategy_name,
+                "signal_price_cents": candidate.price_cents,
+                "contracts": candidate.contracts,
+            }
+        )
+        for attempt_index in range(max_attempts):
+            remaining_contracts = max(int(current_candidate.contracts) - total_filled_contracts, 0)
+            if remaining_contracts <= 0:
+                break
+            snapshot = current_candidate.snapshot
+            execution_price_cents = min(current_candidate.price_cents + max(self.config.execution_cross_cents, 0), 99)
+            orderbook_available_contracts: int | None = None
+            orderbook_payload: dict[str, Any] | None = None
+            if self.config.use_orderbook_precheck:
+                try:
+                    orderbook_payload = self.client.get_orderbook(snapshot.market_ticker)
+                    orderbook_available_contracts = _available_contracts_at_price(
+                        orderbook_payload,
+                        side=current_candidate.side,
+                        limit_price_cents=execution_price_cents,
+                    )
+                except Exception:
+                    orderbook_payload = None
+                    orderbook_available_contracts = None
+            self._trace_execution_event(
+                {
+                    "event": "execution_attempt_ready",
+                    "market_ticker": snapshot.market_ticker,
+                    "attempt": attempt_index + 1,
+                    "side": current_candidate.side,
+                    "strategy_name": current_candidate.strategy_name,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "remaining_contracts": remaining_contracts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+            )
+            if self.config.use_orderbook_precheck:
+                min_fill_contracts = max(
+                    1,
+                    int(math.ceil(remaining_contracts * max(float(self.config.min_orderbook_fill_fraction), 0.0))),
+                )
+                if (
+                    orderbook_available_contracts is not None
+                    and orderbook_available_contracts < min_fill_contracts
+                ):
+                    attempts.append(
+                        {
+                            "attempt": attempt_index + 1,
+                            "signal_price_cents": current_candidate.price_cents,
+                            "execution_price_cents": execution_price_cents,
+                            "orderbook_available_contracts": orderbook_available_contracts,
+                            "min_fill_contracts": min_fill_contracts,
+                            "status": "skipped_no_depth",
+                        }
+                    )
+                    self._trace_execution_event(
+                        {
+                            "event": "execution_attempt_skipped_no_depth",
+                            "market_ticker": snapshot.market_ticker,
+                            "attempt": attempt_index + 1,
+                            "side": current_candidate.side,
+                            "strategy_name": current_candidate.strategy_name,
+                            "signal_price_cents": current_candidate.price_cents,
+                            "execution_price_cents": execution_price_cents,
+                            "orderbook_available_contracts": orderbook_available_contracts,
+                            "min_fill_contracts": min_fill_contracts,
+                        }
+                    )
+                    return {
+                        "status": "skipped_no_depth",
+                        "side": current_candidate.side,
+                        "strategy_name": current_candidate.strategy_name,
+                        "confidence": current_candidate.confidence,
+                        "gbm_probability": current_candidate.gbm_probability,
+                        "gbm_edge": current_candidate.gbm_edge,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "filled_contracts": total_filled_contracts,
+                        "payload": None,
+                        "response": None,
+                        "attempts": attempts,
+                        "orderbook_available_contracts": orderbook_available_contracts,
+                    }
+            payload = {
+                "ticker": snapshot.market_ticker,
+                "action": "buy",
+                "side": current_candidate.side,
+                "count": remaining_contracts,
+                "type": "limit",
+                "yes_price": execution_price_cents if current_candidate.side == "yes" else None,
+                "no_price": execution_price_cents if current_candidate.side == "no" else None,
+                "client_order_id": f"kabot-exec-{snapshot.market_ticker}-{int(snapshot.observed_at.timestamp())}-{attempt_index}",
+                "time_in_force": self.config.entry_time_in_force,
+            }
+            payload = {key: value for key, value in payload.items() if value is not None}
+            if self.config.dry_run:
+                self._trace_execution_event(
+                    {
+                        "event": "execution_attempt_dry_run",
+                        "market_ticker": snapshot.market_ticker,
+                        "attempt": attempt_index + 1,
+                        "payload": payload,
+                    }
+                )
+                return {
+                    "status": "dry_run",
+                    "side": current_candidate.side,
+                    "strategy_name": current_candidate.strategy_name,
+                    "confidence": current_candidate.confidence,
+                    "gbm_probability": current_candidate.gbm_probability,
+                    "gbm_edge": current_candidate.gbm_edge,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "filled_contracts": 0,
+                    "payload": payload,
+                    "attempts": attempts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+            response = self.client.create_order(payload)
+            order_id = _extract_order_id(response)
+            response_order = response.get("order", response) if isinstance(response, dict) else {}
+            order_status = _extract_order_status(response_order if isinstance(response_order, dict) else {})
+            filled_contracts = _extract_fill_count(response_order if isinstance(response_order, dict) else {})
+            fills_response: dict[str, Any] | None = None
+            exchange_filled_contracts: int | None = None
+            if order_id:
+                try:
+                    fills_response = self.client.get_fills(order_id=order_id, ticker=snapshot.market_ticker)
+                    exchange_filled_contracts = _filled_contracts_from_fills(fills_response)
+                except Exception:
+                    fills_response = None
+                    exchange_filled_contracts = None
+            if exchange_filled_contracts is not None:
+                filled_contracts = exchange_filled_contracts
+            total_filled_contracts += filled_contracts
+            last_status = order_status or "submitted"
+            last_response = response
+            last_payload = payload
+            last_execution_price_cents = execution_price_cents
+            if (
+                self.config.entry_time_in_force != "immediate_or_cancel"
+                and order_status in {"resting", "open", "submitted", "pending"}
+            ):
+                self.local_resting_entry_locks[snapshot.market_ticker] = LocalRestingEntryLock(
+                    created_at=datetime.now(UTC),
+                    side=current_candidate.side,
+                    strategy_name=current_candidate.strategy_name,
+                    price_cents=current_candidate.price_cents,
+                    gbm_edge=current_candidate.gbm_edge,
+                    gbm_probability=current_candidate.gbm_probability,
+                    observed_at=snapshot.observed_at,
+                    contracts=remaining_contracts,
+                )
+                if order_id and self.fill_feed is not None:
+                    self.fill_feed.register_order(snapshot.market_ticker, order_id)
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt_index + 1,
+                "signal_price_cents": current_candidate.price_cents,
+                "execution_price_cents": execution_price_cents,
+                "payload": payload,
+                "response": response,
+                "order_id": order_id,
+                "status": order_status or "submitted",
+                "filled_contracts": filled_contracts,
+                "exchange_filled_contracts": exchange_filled_contracts,
+                "orderbook_available_contracts": orderbook_available_contracts,
+            }
+            attempts.append(attempt_record)
+            self._trace_execution_event(
+                {
+                    "event": "execution_attempt_submitted",
+                    "market_ticker": snapshot.market_ticker,
+                    "attempt": attempt_index + 1,
+                    "side": current_candidate.side,
+                    "strategy_name": current_candidate.strategy_name,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "status": order_status or "submitted",
+                    "filled_contracts": filled_contracts,
+                    "exchange_filled_contracts": exchange_filled_contracts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+            )
+            if total_filled_contracts >= int(candidate.contracts) or attempt_index >= max_attempts - 1:
+                break
+            time.sleep(max(float(self.config.execution_session_retry_delay_seconds), 0.0))
+            refreshed_candidate = self._refresh_candidate_from_live_state(current_candidate=current_candidate)
+            if refreshed_candidate is None:
+                self._trace_execution_event(
+                    {
+                        "event": "execution_attempt_not_retried",
+                        "market_ticker": snapshot.market_ticker,
+                        "attempt": attempt_index + 1,
+                        "reason": "live_state_refresh_failed_or_signal_broke",
+                    }
+                )
+                break
+            current_candidate = refreshed_candidate
+        self._trace_execution_event(
+            {
+                "event": "execution_session_complete",
+                "market_ticker": candidate.snapshot.market_ticker,
+                "side": candidate.side,
+                "strategy_name": candidate.strategy_name,
+                "status": last_status if attempts else "abandoned",
+                "filled_contracts": total_filled_contracts,
+                "attempt_count": len(attempts),
+            }
+        )
+        return {
+            "status": last_status if attempts else "abandoned",
+            "side": candidate.side,
+            "strategy_name": candidate.strategy_name,
+            "confidence": candidate.confidence,
+            "gbm_probability": candidate.gbm_probability,
+            "gbm_edge": candidate.gbm_edge,
+            "signal_price_cents": candidate.price_cents,
+            "execution_price_cents": last_execution_price_cents,
+            "filled_contracts": total_filled_contracts,
+            "payload": last_payload,
+            "response": last_response,
+            "attempts": attempts,
+            "exchange_filled_contracts": total_filled_contracts,
+            "orderbook_available_contracts": attempts[-1].get("orderbook_available_contracts") if attempts else None,
+        }
+
+    def _refresh_candidate_from_live_state(
+        self,
+        *,
+        current_candidate: StrategyCandidate,
+    ) -> StrategyCandidate | None:
+        observed_at = datetime.now(UTC)
+        spot_price = self._latest_spot_price(current_candidate.snapshot.spot_price)
+        refreshed_snapshot = self._snapshot_for_ticker(
+            ticker=current_candidate.snapshot.market_ticker,
+            spot_price=spot_price,
+            observed_at=observed_at,
+        )
+        if refreshed_snapshot is None and self.config.execution_session_use_rest_fallback:
+            try:
+                latest_market = self.client.get_market(current_candidate.snapshot.market_ticker)
+                latest_raw = latest_market.get("market") if isinstance(latest_market.get("market"), dict) else latest_market
+                refreshed_snapshot = normalize_market(
+                    {**latest_raw, "series_ticker": self.config.series_ticker},
+                    spot_price=spot_price,
+                    observed_at=observed_at,
+                    source="kalshi_live_exec_fallback",
+                )
+            except Exception:
+                refreshed_snapshot = None
+        if refreshed_snapshot is None:
+            return None
+        return self._refresh_candidate(current_candidate=current_candidate, snapshot=refreshed_snapshot)
+
+    def _submit_order(self, candidate: StrategyCandidate) -> dict[str, Any]:
+        if self.config.enable_execution_sessions:
+            return self._submit_order_via_execution_session(candidate)
+        attempts: list[dict[str, Any]] = []
+        current_candidate = candidate
+        max_attempts = max(int(self.config.max_entry_retries), 0) + 1
+        total_filled_contracts = 0
+        last_status = "submitted"
+        last_response: dict[str, Any] | None = None
+        last_payload: dict[str, Any] | None = None
+        last_execution_price_cents = min(candidate.price_cents + max(self.config.execution_cross_cents, 0), 99)
+
+        for attempt_index in range(max_attempts):
+            snapshot = current_candidate.snapshot
+            remaining_contracts = max(int(current_candidate.contracts) - total_filled_contracts, 0)
+            if remaining_contracts <= 0:
+                break
+            execution_price_cents = min(current_candidate.price_cents + max(self.config.execution_cross_cents, 0), 99)
+            orderbook_available_contracts: int | None = None
+            orderbook_payload: dict[str, Any] | None = None
+            if self.config.use_orderbook_precheck:
+                try:
+                    orderbook_payload = self.client.get_orderbook(snapshot.market_ticker)
+                    orderbook_available_contracts = _available_contracts_at_price(
+                        orderbook_payload,
+                        side=current_candidate.side,
+                        limit_price_cents=execution_price_cents,
+                    )
+                except Exception:
+                    orderbook_payload = None
+                    orderbook_available_contracts = None
+                min_fill_contracts = max(
+                    1,
+                    int(math.ceil(remaining_contracts * max(float(self.config.min_orderbook_fill_fraction), 0.0))),
+                )
+                if (
+                    orderbook_available_contracts is not None
+                    and orderbook_available_contracts < min_fill_contracts
+                ):
+                    attempts.append(
+                        {
+                            "attempt": attempt_index + 1,
+                            "signal_price_cents": current_candidate.price_cents,
+                            "execution_price_cents": execution_price_cents,
+                            "orderbook_available_contracts": orderbook_available_contracts,
+                            "min_fill_contracts": min_fill_contracts,
+                            "status": "skipped_no_depth",
+                            "orderbook": orderbook_payload,
+                        }
+                    )
+                    return {
+                        "status": "skipped_no_depth",
+                        "side": current_candidate.side,
+                        "strategy_name": current_candidate.strategy_name,
+                        "confidence": current_candidate.confidence,
+                        "gbm_probability": current_candidate.gbm_probability,
+                        "gbm_edge": current_candidate.gbm_edge,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "filled_contracts": total_filled_contracts,
+                        "payload": None,
+                        "response": None,
+                        "attempts": attempts,
+                        "orderbook_available_contracts": orderbook_available_contracts,
+                    }
+            payload = {
+                "ticker": snapshot.market_ticker,
+                "action": "buy",
+                "side": current_candidate.side,
+                "count": remaining_contracts,
+                "type": "limit",
+                "yes_price": execution_price_cents if current_candidate.side == "yes" else None,
+                "no_price": execution_price_cents if current_candidate.side == "no" else None,
+                "client_order_id": f"kabot-{snapshot.market_ticker}-{int(snapshot.observed_at.timestamp())}-{attempt_index}",
+                "time_in_force": self.config.entry_time_in_force,
+            }
+            payload = {key: value for key, value in payload.items() if value is not None}
+
+            if self.config.dry_run:
+                return {
+                    "status": "dry_run",
+                    "side": current_candidate.side,
+                    "strategy_name": current_candidate.strategy_name,
+                    "confidence": current_candidate.confidence,
+                    "gbm_probability": current_candidate.gbm_probability,
+                    "gbm_edge": current_candidate.gbm_edge,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "filled_contracts": 0,
+                    "payload": payload,
+                    "attempts": attempts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+
+            response = self.client.create_order(payload)
+            order_id = _extract_order_id(response)
+            response_order = response.get("order", response) if isinstance(response, dict) else {}
+            order_status = _extract_order_status(response_order if isinstance(response_order, dict) else {})
+            filled_contracts = _extract_fill_count(response_order if isinstance(response_order, dict) else {})
+            fills_response: dict[str, Any] | None = None
+            exchange_filled_contracts: int | None = None
+            if order_id:
+                try:
+                    fills_response = self.client.get_fills(order_id=order_id, ticker=snapshot.market_ticker)
+                    exchange_filled_contracts = _filled_contracts_from_fills(fills_response)
+                except Exception:
+                    fills_response = None
+                    exchange_filled_contracts = None
+            if exchange_filled_contracts is not None:
+                filled_contracts = exchange_filled_contracts
+            total_filled_contracts += filled_contracts
+            last_status = order_status or "submitted"
+            last_response = response
+            last_payload = payload
+            last_execution_price_cents = execution_price_cents
+            # If the order is resting (limit order sitting on the book), register it with
+            # the fill feed so the next cycle skips the list_orders REST poll.
+            if (
+                order_id
+                and order_status in {"resting", "open", "submitted", "pending"}
+                and self.fill_feed is not None
+            ):
+                self.fill_feed.register_order(snapshot.market_ticker, order_id)
+            if self.config.entry_time_in_force != "immediate_or_cancel" and order_status in {"resting", "open", "submitted", "pending"}:
+                self.local_resting_entry_locks[snapshot.market_ticker] = LocalRestingEntryLock(
+                    created_at=datetime.now(UTC),
+                    side=current_candidate.side,
+                    strategy_name=current_candidate.strategy_name,
+                    price_cents=current_candidate.price_cents,
+                    gbm_edge=current_candidate.gbm_edge,
+                    gbm_probability=current_candidate.gbm_probability,
+                    observed_at=snapshot.observed_at,
+                    contracts=remaining_contracts,
+                )
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt_index + 1,
+                "signal_price_cents": current_candidate.price_cents,
+                "execution_price_cents": execution_price_cents,
+                "payload": payload,
+                "response": response,
+                "order_id": order_id,
+                "status": order_status or "submitted",
+                "filled_contracts": filled_contracts,
+                "exchange_filled_contracts": exchange_filled_contracts,
+                "fills_response": fills_response,
+                "orderbook_available_contracts": orderbook_available_contracts,
+            }
+
+            if self.config.entry_time_in_force == "immediate_or_cancel":
+                attempts.append(attempt_record)
+                remaining_contracts = max(int(current_candidate.contracts) - total_filled_contracts, 0)
+                if remaining_contracts <= 0 or attempt_index >= max_attempts - 1:
+                    return {
+                        "status": order_status or "submitted",
+                        "side": current_candidate.side,
+                        "strategy_name": current_candidate.strategy_name,
+                        "confidence": current_candidate.confidence,
+                        "gbm_probability": current_candidate.gbm_probability,
+                        "gbm_edge": current_candidate.gbm_edge,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "filled_contracts": total_filled_contracts,
+                        "payload": payload,
+                        "response": response,
+                        "attempts": attempts,
+                        "exchange_filled_contracts": exchange_filled_contracts,
+                        "orderbook_available_contracts": orderbook_available_contracts,
+                    }
+                time.sleep(max(float(self.config.ioc_retry_delay_seconds), 0.0))
+                latest_market = self.client.get_market(snapshot.market_ticker)
+                latest_raw = latest_market.get("market") if isinstance(latest_market.get("market"), dict) else latest_market
+                refreshed_snapshot = normalize_market(
+                    {**latest_raw, "series_ticker": self.config.series_ticker},
+                    spot_price=snapshot.spot_price,
+                    observed_at=datetime.now(UTC),
+                    source="kalshi_live_ioc_retry",
+                )
+                refreshed_candidate = self._refresh_candidate(current_candidate=current_candidate, snapshot=refreshed_snapshot)
+                if refreshed_candidate is None:
+                    return {
+                        "status": "ioc_not_retried",
+                        "side": current_candidate.side,
+                        "strategy_name": current_candidate.strategy_name,
+                        "confidence": current_candidate.confidence,
+                        "gbm_probability": current_candidate.gbm_probability,
+                        "gbm_edge": current_candidate.gbm_edge,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "filled_contracts": total_filled_contracts,
+                        "payload": payload,
+                        "response": response,
+                        "attempts": attempts,
+                        "exchange_filled_contracts": exchange_filled_contracts,
+                        "orderbook_available_contracts": orderbook_available_contracts,
+                    }
+                current_candidate = StrategyCandidate(
+                    strategy_name=refreshed_candidate.strategy_name,
+                    confidence=refreshed_candidate.confidence,
+                    snapshot=refreshed_candidate.snapshot,
+                    side=refreshed_candidate.side,
+                    price_cents=refreshed_candidate.price_cents,
+                    contracts=max(int(refreshed_candidate.contracts), total_filled_contracts + remaining_contracts),
+                    gbm_probability=refreshed_candidate.gbm_probability,
+                    gbm_edge=refreshed_candidate.gbm_edge,
+                )
+                continue
+
+            if attempt_index >= max_attempts - 1 or not order_id:
+                attempts.append(attempt_record)
+                return {
+                    "status": order_status or "submitted",
+                    "side": current_candidate.side,
+                    "strategy_name": current_candidate.strategy_name,
+                    "confidence": current_candidate.confidence,
+                    "gbm_probability": current_candidate.gbm_probability,
+                    "gbm_edge": current_candidate.gbm_edge,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "filled_contracts": filled_contracts,
+                    "payload": payload,
+                    "response": response,
+                    "attempts": attempts,
+                    "exchange_filled_contracts": exchange_filled_contracts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+
+            time.sleep(max(float(self.config.resting_order_retry_delay_seconds), 0.0))
+            refreshed = self.client.get_order(order_id)
+            refreshed_order = refreshed.get("order", refreshed) if isinstance(refreshed, dict) else {}
+            refreshed_status = _extract_order_status(refreshed_order if isinstance(refreshed_order, dict) else {})
+            refreshed_filled_contracts = _extract_fill_count(refreshed_order if isinstance(refreshed_order, dict) else {})
+            attempt_record["post_wait_status"] = refreshed_status or "unknown"
+            attempt_record["post_wait_response"] = refreshed
+            attempt_record["post_wait_filled_contracts"] = refreshed_filled_contracts
+            if refreshed_status not in {"resting", "open", "submitted", "pending"}:
+                attempts.append(attempt_record)
+                return {
+                    "status": refreshed_status or order_status or "submitted",
+                    "strategy_name": current_candidate.strategy_name,
+                    "confidence": current_candidate.confidence,
+                    "gbm_probability": current_candidate.gbm_probability,
+                    "gbm_edge": current_candidate.gbm_edge,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "filled_contracts": refreshed_filled_contracts,
+                    "payload": payload,
+                    "response": response,
+                    "attempts": attempts,
+                    "exchange_filled_contracts": exchange_filled_contracts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+
+            cancel_response = self.client.cancel_order(order_id)
+            attempt_record["cancel_response"] = cancel_response
+            attempts.append(attempt_record)
+            latest_market = self.client.get_market(snapshot.market_ticker)
+            latest_raw = latest_market.get("market") if isinstance(latest_market.get("market"), dict) else latest_market
+            refreshed_snapshot = normalize_market(
+                {**latest_raw, "series_ticker": self.config.series_ticker},
+                spot_price=snapshot.spot_price,
+                observed_at=datetime.now(UTC),
+                source="kalshi_live_retry",
+            )
+            refreshed_candidate = self._refresh_candidate(current_candidate=current_candidate, snapshot=refreshed_snapshot)
+            if refreshed_candidate is None:
+                return {
+                    "status": "canceled_not_retried",
+                    "side": current_candidate.side,
+                    "strategy_name": current_candidate.strategy_name,
+                    "confidence": current_candidate.confidence,
+                    "gbm_probability": current_candidate.gbm_probability,
+                    "gbm_edge": current_candidate.gbm_edge,
+                    "signal_price_cents": current_candidate.price_cents,
+                    "execution_price_cents": execution_price_cents,
+                    "filled_contracts": refreshed_filled_contracts,
+                    "payload": payload,
+                    "response": response,
+                    "attempts": attempts,
+                    "exchange_filled_contracts": exchange_filled_contracts,
+                    "orderbook_available_contracts": orderbook_available_contracts,
+                }
+            current_candidate = refreshed_candidate
+
+        return {
+            "status": last_status if attempts else "abandoned",
+            "side": candidate.side,
+            "strategy_name": candidate.strategy_name,
+            "confidence": candidate.confidence,
+            "gbm_probability": candidate.gbm_probability,
+            "gbm_edge": candidate.gbm_edge,
+            "signal_price_cents": candidate.price_cents,
+            "execution_price_cents": last_execution_price_cents,
+            "filled_contracts": total_filled_contracts,
+            "payload": last_payload,
+            "response": last_response,
+            "attempts": attempts,
+            "exchange_filled_contracts": total_filled_contracts,
+        }
+
+    def _refresh_candidate(
+        self,
+        *,
+        current_candidate: StrategyCandidate,
+        snapshot: MarketSnapshot,
+    ) -> StrategyCandidate | None:
+        if snapshot.contract_type != "threshold" or snapshot.threshold is None:
+            return None
+        if (snapshot.volume or 0.0) < self.config.min_market_volume:
+            return None
+        rule = next((item for item in self._strategy_rules() if item.name == current_candidate.strategy_name), None)
+        if rule is None:
+            return None
+        tte_minutes = _time_to_expiry_minutes(snapshot)
+        if not (rule.min_tte_minutes < tte_minutes < rule.max_tte_minutes):
+            return None
+        if rule.side == "yes" and snapshot.spot_price < (snapshot.threshold + self.config.distance_threshold_dollars):
+            return None
+        if rule.side == "no" and snapshot.spot_price > (snapshot.threshold - self.config.distance_threshold_dollars):
+            return None
+        ask_cents, bid_cents = _side_prices(snapshot, rule.side)
+        if ask_cents is None or bid_cents is None:
+            return None
+        spread_cents = ask_cents - bid_cents
+        if not (rule.min_price_cents <= ask_cents <= rule.max_price_cents):
+            return None
+        if spread_cents >= rule.max_spread_cents:
+            return None
+        volatility = self._estimate_live_volatility(observed_at=snapshot.observed_at)
+        if volatility is None:
+            return None
+        estimate = self.model.estimate(snapshot, volatility=volatility)
+        market_probability = ask_cents / 100.0
+        side_probability = estimate.probability if rule.side == "yes" else (1.0 - estimate.probability)
+        edge = side_probability - market_probability
+        if edge < self._required_gbm_edge(strategy_name=rule.name, ask_cents=ask_cents):
+            return None
+        confidence = _confidence_for_candidate(
+            rule_name=rule.name,
+            tte_minutes=tte_minutes,
+            ask_cents=ask_cents,
+            spread_cents=spread_cents,
+        )
+        return StrategyCandidate(
+            strategy_name=rule.name,
+            confidence=confidence,
+            snapshot=snapshot,
+            side=rule.side,
+            price_cents=ask_cents,
+            contracts=_effective_contracts_for_price(ask_cents=ask_cents, contracts=current_candidate.contracts),
+            gbm_probability=side_probability,
+            gbm_edge=edge,
+        )
+
+
+def build_live_trader(*, store: PostgresStore, config: LiveTraderConfig) -> LiveTrader:
+    api_key_id = os.getenv("KABOT_KALSHI_API_KEY_ID", "").strip()
+    private_key_path = os.getenv("KABOT_KALSHI_PRIVATE_KEY_PATH", "").strip()
+    if not api_key_id or not private_key_path:
+        raise ValueError("Missing KABOT_KALSHI_API_KEY_ID or KABOT_KALSHI_PRIVATE_KEY_PATH")
+    signer = KalshiAuthSigner(KalshiAuthConfig(api_key_id=api_key_id, private_key_path=private_key_path))
+    client = KabotKalshiClient(auth_signer=signer)
+    return LiveTrader(store=store, client=client, config=config)

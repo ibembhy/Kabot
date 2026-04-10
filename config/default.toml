@@ -1,0 +1,45 @@
+[app]
+name = "Kabot"
+timezone = "UTC"
+
+[storage]
+db_dsn = "postgresql://kabot:kabot@localhost/kabot"
+
+[data]
+underlying_symbol = "BTC-USD"
+base_timeframe = "1m"
+resample_timeframe = "5min"
+volatility_window = 12
+annualization_factor = 105120.0
+
+[markets]
+series_tickers = ["KXBTCD", "KXBTC15M"]
+min_minutes_to_expiry = 0
+max_minutes_to_expiry = 15
+
+[model]
+name = "gbm_threshold"
+drift = 0.0
+volatility_floor = 0.05
+
+[signal]
+min_edge = 0.05
+min_contract_price_cents = 35
+max_contract_price_cents = 65
+max_spread_cents = 6
+max_near_money_bps = 500.0
+min_confidence = 0.0
+
+[trading]
+take_profit_cents = 8
+stop_loss_cents = 10
+fair_value_buffer_cents = 3
+time_exit_minutes_before_expiry = 2
+allow_reentry = false
+
+[backtest]
+entry_slippage_cents = 1
+exit_slippage_cents = 1
+fee_rate_bps = 0.0
+starting_bankroll = 1000.0
+
