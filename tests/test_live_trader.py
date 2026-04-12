@@ -16,6 +16,7 @@ from kabot.trading.live_trader import (
     select_entry_candidates,
     summarize_rejections,
 )
+from kabot.trading.ws_feeds import KalshiFillFeed
 from kabot.types import MarketSnapshot
 from kabot.types import Position
 
@@ -1542,6 +1543,46 @@ def test_local_resting_entry_lock_expires_without_exchange_confirmation() -> Non
 
     assert active == set()
     assert "TEST" not in trader.local_resting_entry_locks
+
+
+def test_resting_buy_tickers_reconcile_stale_ws_cache_against_rest() -> None:
+    class _NoRestingOrdersClient(_StubClient):
+        def list_orders(self, *, status: str | None = None, limit: int = 200) -> dict:
+            return {"orders": []}
+
+    class _StaleFillFeed:
+        def __init__(self) -> None:
+            self.deregistered: list[str] = []
+
+        def get_resting_tickers(self) -> set[str]:
+            return {"STALE"}
+
+        def deregister_order(self, market_ticker: str) -> None:
+            self.deregistered.append(market_ticker)
+
+    fill_feed = _StaleFillFeed()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=_NoRestingOrdersClient(),  # type: ignore[arg-type]
+        config=LiveTraderConfig(gbm_min_points=3),
+    )
+    trader.fill_feed = fill_feed  # type: ignore[assignment]
+
+    active = trader._resting_buy_market_tickers()
+
+    assert active == set()
+    assert fill_feed.deregistered == ["STALE"]
+
+
+def test_fill_feed_treats_executed_order_update_as_terminal() -> None:
+    feed = KalshiFillFeed(auth_signer=None)
+    feed._healthy = True
+    feed.register_order("TEST", "order-1")
+
+    feed._on_message(None, json.dumps({"type": "order_group_updates", "order_id": "order-1", "status": "executed"}))
+
+    assert feed.get_resting_tickers() == set()
+    assert feed.get_resting_order_id("TEST") is None
 
 
 def test_execution_state_drops_stale_ws_quotes() -> None:

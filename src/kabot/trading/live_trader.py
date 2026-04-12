@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from kabot.compat import UTC
 from kabot.markets.normalize import normalize_market
 from kabot.models.gbm_threshold import GBMThresholdModel
+from kabot.models.latency_repricing import LatencyRepricingModel
 from kabot.storage.postgres import PostgresStore
 from kabot.trading.execution_state import ExecutionStateStore
 from kabot.trading.execution_trace import ExecutionTraceWriter
@@ -504,7 +506,7 @@ class LiveTraderConfig:
     execution_heartbeat_seconds: float = 2.0
     event_loop_sleep_seconds: float = 0.1
     reentry_edge_premium: float = 0.02
-    reentry_max_per_market: int = 1
+    reentry_max_per_market: int = 3
     reentry_min_price_improvement_cents: int = 3
     exit_distance_threshold_dollars: float = 5.0
     signal_break_confirmation_cycles: int = 2
@@ -518,6 +520,7 @@ class LiveTraderConfig:
     failed_entry_backoff_after_attempts: int = 3
     failed_entry_decay_seconds: float = 15.0
     local_resting_entry_lock_seconds: float = 2.0
+    settlement_timeout_seconds: float = 300.0
     min_orderbook_fill_fraction: float = 0.5
     resting_order_retry_delay_seconds: float = 2.0
     ioc_retry_delay_seconds: float = 0.15
@@ -525,6 +528,10 @@ class LiveTraderConfig:
     entry_time_in_force: str = "immediate_or_cancel"
     exit_time_in_force: str = "immediate_or_cancel"
     metadata_refresh_seconds: int = 60
+    whipsaw_crossing_window_minutes: float = 30.0
+    whipsaw_max_crossings: int = 999999
+    overnight_edge_multiplier: float = 1.0
+    overnight_hours_utc: tuple[int, int] = (0, 7)
 
 
 @dataclass(frozen=True)
@@ -701,6 +708,14 @@ def _extract_position_count(position: dict[str, Any]) -> float:
 
 
 def _extract_fill_count(order: dict[str, Any]) -> int:
+    # Kalshi v2: filled quantity = count - remaining_count
+    count_raw = order.get("count")
+    remaining_raw = order.get("remaining_count")
+    if count_raw not in (None, "") and remaining_raw not in (None, ""):
+        try:
+            return max(int(round(float(count_raw))) - int(round(float(remaining_raw))), 0)
+        except (TypeError, ValueError):
+            pass
     for key in ("fill_count_fp", "fill_count", "count_fp", "count"):
         raw = order.get(key)
         if raw in (None, ""):
@@ -922,7 +937,11 @@ class LiveTrader:
         self.store = store
         self.client = client
         self.config = config
-        self.model = GBMThresholdModel(volatility_floor=config.gbm_volatility_floor)
+        self.model = LatencyRepricingModel(
+            volatility_floor=config.gbm_volatility_floor,
+            persistence_factor=0.75,
+            min_move_bps=3.0,
+        )
         self.local_positions: dict[str, Position] = {}
         self.position_strategies: dict[str, str] = {}
         self.reentry_states: dict[str, SignalBreakReentryState] = {}
@@ -934,10 +953,15 @@ class LiveTrader:
         self.failed_entry_last_attempt: dict[str, datetime] = {}
         self.failed_entry_last_price: dict[str, int] = {}
         self.failed_entry_last_edge: dict[str, float] = {}
+        self.settlement_pending_since: dict[str, datetime] = {}
+        self._prev_spot_price: float | None = None
+        self._spot_price_history: deque[tuple[datetime, float]] = deque()
+        self._loss_streak_path = Path("data/loss_streak.json")
         self.closed_trades: list[ClosedTrade] = []
         self.submitted_trade_times: list[datetime] = []
         self.consecutive_losses = 0
         self.cooldown_until: datetime | None = None
+        self._load_loss_streak_state()
         # WebSocket feeds — started in run_forever()
         self.spot_feed = CoinbaseSpotFeed()
         auth_signer = getattr(client, "auth_signer", None)
@@ -952,8 +976,66 @@ class LiveTrader:
     def _strategy_rules(self) -> tuple[StrategyRule, ...]:
         return _strategy_rules_with_max_tte(self.config.entry_max_tte_minutes)
 
+    def _recover_orphaned_positions(self) -> None:
+        """On startup, sync any open exchange positions into local state so they track through settlement."""
+        try:
+            account_contracts = self._account_position_contracts()
+        except Exception:
+            return
+        if not account_contracts:
+            return
+        observed_at = datetime.now(UTC)
+        try:
+            positions_payload = self.client.get_positions()
+            positions_list = _extract_positions(positions_payload)
+        except Exception:
+            return
+        positions_by_ticker: dict[str, dict[str, Any]] = {}
+        for pos in positions_list:
+            ticker = _extract_market_ticker(pos)
+            if ticker:
+                positions_by_ticker[ticker] = pos
+        for ticker, contracts in account_contracts.items():
+            if contracts <= 0 or ticker in self.local_positions:
+                continue
+            metadata = self._market_metadata.get(ticker)
+            if metadata is None:
+                continue
+            pos = positions_by_ticker.get(ticker)
+            if pos is None:
+                continue
+            count = _extract_position_count(pos)
+            if count == 0:
+                continue
+            side: str = "yes" if count > 0 else "no"
+            expiry_raw = metadata.get("close_time") or metadata.get("expiry") or metadata.get("expected_expiration_time")
+            if expiry_raw is None:
+                continue
+            try:
+                expiry = datetime.fromisoformat(str(expiry_raw).replace("Z", "+00:00")).astimezone(UTC)
+            except Exception:
+                continue
+            self.local_positions[ticker] = Position(
+                position_id=f"recovered-{ticker}",
+                market_ticker=ticker,
+                side=side,  # type: ignore[arg-type]
+                contracts=int(abs(count)),
+                entry_time=observed_at,
+                entry_price_cents=50,
+                expiry=expiry,
+            )
+            self.position_strategies[ticker] = "recovered"
+            self._trace_execution_event({
+                "event": "position_recovered_on_startup",
+                "market_ticker": ticker,
+                "side": side,
+                "contracts": int(abs(count)),
+                "expiry": expiry,
+            })
+
     def run_forever(self) -> None:
         self._refresh_market_metadata()
+        self._recover_orphaned_positions()
         self.spot_feed.start()
         if self.ticker_feed is not None:
             self.ticker_feed.start()
@@ -1008,6 +1090,7 @@ class LiveTrader:
                 "closed_positions": [closed.__dict__ for closed in closed_now],
                 "reject_summary": {"stale_spot": 1},
             }
+        self._append_spot_price_history(observed_at=observed_at, spot_price=spot_price)
 
         if self.cooldown_until is not None and observed_at < self.cooldown_until:
             return {
@@ -1118,13 +1201,20 @@ class LiveTrader:
             external_position_tickers = {
                 ticker for ticker, contracts in account_position_contracts.items() if contracts > 0 and ticker not in local_position_contracts
             }
-            open_tickers = set(local_position_contracts) | external_position_tickers | set(resting_order_tickers)
+            local_resting_entry_tickers = self._active_local_resting_entry_tickers(
+                observed_at=observed_at,
+                resting_order_tickers=set(resting_order_tickers),
+                account_position_contracts=account_position_contracts,
+                local_position_contracts=local_position_contracts,
+            )
+            open_tickers = set(local_position_contracts) | external_position_tickers | set(resting_order_tickers) | local_resting_entry_tickers
             active_strategy_counts = self._active_strategy_counts()
             permanently_blocked_tickers = set(self.signal_break_blocked_tickers)
         candidates = select_entry_candidates(
             fresh_snapshots,
             blocked_markets=set(external_position_tickers)
             | set(resting_order_tickers)
+            | local_resting_entry_tickers
             | permanently_blocked_tickers,
             current_position_contracts=dict(local_position_contracts),
             current_position_strategies=dict(self.position_strategies),
@@ -1144,6 +1234,17 @@ class LiveTrader:
             min_market_volume=self.config.min_market_volume,
             strategy_rules=strategy_rules,
         )
+        whipsaw_filtered: list[StrategyCandidate] = []
+        for candidate in candidates:
+            threshold = candidate.snapshot.threshold
+            if threshold is not None and self._count_threshold_crossings(
+                threshold=float(threshold),
+                window_minutes=float(self.config.whipsaw_crossing_window_minutes),
+            ) > int(self.config.whipsaw_max_crossings):
+                _increment_reason(reject_summary, "whipsaw_skip")
+                continue
+            whipsaw_filtered.append(candidate)
+        candidates = whipsaw_filtered
         gbm_filtered: list[StrategyCandidate] = []
         for candidate in candidates:
             if volatility is None:
@@ -1392,19 +1493,30 @@ class LiveTrader:
                 self.local_resting_entry_locks.pop(ticker, None)
                 self.failed_entry_attempts.pop(ticker, None)
                 self.failed_entry_blocked_until.pop(ticker, None)
+                self.settlement_pending_since.pop(ticker, None)
         if new_tickers and self.ticker_feed is not None:
             self.ticker_feed.subscribe(new_tickers)
         self._last_metadata_refresh = datetime.now(UTC)
 
     def _build_snapshots(self, *, spot_price: float, observed_at: datetime) -> list[MarketSnapshot]:
         """Merge WS price updates with REST metadata to build MarketSnapshots."""
+        recent_log_return = 0.0
+        if self._prev_spot_price is not None and self._prev_spot_price > 0 and spot_price > 0:
+            recent_log_return = math.log(spot_price / self._prev_spot_price)
+        self._prev_spot_price = spot_price
         ws_prices = self.ticker_feed.snapshot() if self.ticker_feed is not None else {}
-        return self.state_store.build_snapshots(
+        snapshots = self.state_store.build_snapshots(
             ws_snapshot=ws_prices,
             spot_price=spot_price,
             observed_at=observed_at,
             max_quote_age_seconds=self.config.max_ws_quote_age_seconds,
         )
+        if recent_log_return != 0.0:
+            snapshots = [
+                replace(s, metadata={**s.metadata, "recent_log_return": recent_log_return})
+                for s in snapshots
+            ]
+        return snapshots
 
     def _snapshot_for_ticker(self, *, ticker: str, spot_price: float, observed_at: datetime) -> MarketSnapshot | None:
         ws_prices = self.ticker_feed.get_prices(ticker) if self.ticker_feed is not None else None
@@ -1747,6 +1859,7 @@ class LiveTrader:
                     realized_pnl_cents=realized_total_cents,
                 )
                 self.closed_trades.append(closed)
+                self._update_loss_streak_from_closed_trade(closed, observed_at=observed_at)
                 self.reentry_states[market_ticker] = SignalBreakReentryState(
                     market_ticker=market_ticker,
                     exited_at=observed_at,
@@ -1765,7 +1878,8 @@ class LiveTrader:
                         "exit_price_cents": exit_price_cents,
                     }
                 )
-                self.signal_break_blocked_tickers.add(market_ticker)
+                if not self.config.enable_signal_break_reentry:
+                    self.signal_break_blocked_tickers.add(market_ticker)
                 remaining_contracts = max(position.contracts - filled_contracts, 0)
                 if remaining_contracts <= 0:
                     del self.local_positions[market_ticker]
@@ -1806,6 +1920,7 @@ class LiveTrader:
                 realized_pnl_cents=realized_total_cents,
             )
             self.closed_trades.append(closed)
+            self._update_loss_streak_from_closed_trade(closed, observed_at=observed_at)
             self.reentry_states[market_ticker] = SignalBreakReentryState(
                 market_ticker=market_ticker,
                 exited_at=observed_at,
@@ -1824,7 +1939,8 @@ class LiveTrader:
                     "exit_price_cents": exit_price_cents,
                 }
             )
-            self.signal_break_blocked_tickers.add(market_ticker)
+            if not self.config.enable_signal_break_reentry:
+                self.signal_break_blocked_tickers.add(market_ticker)
             remaining_contracts = max(position.contracts - filled_contracts, 0)
             self.pending_signal_breaks.pop(market_ticker, None)
             if remaining_contracts <= 0:
@@ -1935,15 +2051,33 @@ class LiveTrader:
                 continue
             try:
                 payload = self.client.get_market(market_ticker)
+                market = payload.get("market") if isinstance(payload.get("market"), dict) else payload
+                settlement_price = self._extract_settlement_price(market)
+                threshold = self._extract_threshold(market)
             except Exception:
-                continue
-            market = payload.get("market") if isinstance(payload.get("market"), dict) else payload
-            settlement_price = self._extract_settlement_price(market)
-            threshold = self._extract_threshold(market)
+                settlement_price = None
+                threshold = None
             if settlement_price is None or threshold is None:
-                continue
-            exit_price_cents = 100 if ((position.side == "yes" and settlement_price >= threshold) or (position.side == "no" and settlement_price < threshold)) else 0
-            pnl_cents = int((exit_price_cents - position.entry_price_cents) * position.contracts)
+                if market_ticker not in self.settlement_pending_since:
+                    self.settlement_pending_since[market_ticker] = observed_at
+                wait_seconds = (observed_at - self.settlement_pending_since[market_ticker]).total_seconds()
+                if wait_seconds < self.config.settlement_timeout_seconds:
+                    continue
+                self._trace_execution_event({
+                    "event": "settlement_forced_timeout",
+                    "market_ticker": market_ticker,
+                    "wait_seconds": wait_seconds,
+                    "settlement_price": settlement_price,
+                    "threshold": threshold,
+                })
+                pnl_cents = 0
+            else:
+                self.settlement_pending_since.pop(market_ticker, None)
+                exit_price_cents = 100 if (
+                    (position.side == "yes" and settlement_price >= threshold)
+                    or (position.side == "no" and settlement_price < threshold)
+                ) else 0
+                pnl_cents = int((exit_price_cents - position.entry_price_cents) * position.contracts)
             strategy_name = self.position_strategies.get(market_ticker, "unknown")
             closed = ClosedTrade(
                 market_ticker=market_ticker,
@@ -1953,18 +2087,78 @@ class LiveTrader:
             )
             closed_now.append(closed)
             self.closed_trades.append(closed)
+            self._update_loss_streak_from_closed_trade(closed, observed_at=observed_at)
             del self.local_positions[market_ticker]
             self.position_strategies.pop(market_ticker, None)
             self.reentry_states.pop(market_ticker, None)
             self.pending_signal_breaks.pop(market_ticker, None)
             self.signal_break_blocked_tickers.discard(market_ticker)
-            if pnl_cents < 0:
-                self.consecutive_losses += 1
-                if self.consecutive_losses >= self.config.cooldown_loss_streak:
-                    self.cooldown_until = observed_at + timedelta(minutes=self.config.cooldown_minutes)
-            else:
-                self.consecutive_losses = 0
         return closed_now
+
+    def _load_loss_streak_state(self) -> None:
+        try:
+            payload = json.loads(self._loss_streak_path.read_text())
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            return
+        try:
+            self.consecutive_losses = max(int(payload.get("consecutive_losses", 0)), 0)
+        except (TypeError, ValueError):
+            self.consecutive_losses = 0
+        cooldown_raw = payload.get("cooldown_until")
+        if cooldown_raw:
+            try:
+                self.cooldown_until = datetime.fromisoformat(str(cooldown_raw).replace("Z", "+00:00")).astimezone(UTC)
+            except ValueError:
+                self.cooldown_until = None
+
+    def _save_loss_streak_state(self) -> None:
+        payload = {
+            "consecutive_losses": int(self.consecutive_losses),
+            "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until is not None else None,
+        }
+        try:
+            self._loss_streak_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._loss_streak_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+            tmp_path.replace(self._loss_streak_path)
+        except OSError:
+            return
+
+    def _update_loss_streak_from_closed_trade(self, closed: ClosedTrade, *, observed_at: datetime) -> None:
+        old_losses = self.consecutive_losses
+        old_cooldown = self.cooldown_until
+        if closed.realized_pnl_cents < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= self.config.cooldown_loss_streak:
+                self.cooldown_until = observed_at + timedelta(minutes=self.config.cooldown_minutes)
+        else:
+            self.consecutive_losses = 0
+        if self.consecutive_losses != old_losses or self.cooldown_until != old_cooldown:
+            self._save_loss_streak_state()
+
+    def _append_spot_price_history(self, *, observed_at: datetime, spot_price: float) -> None:
+        self._spot_price_history.append((observed_at, float(spot_price)))
+        cutoff = observed_at - timedelta(minutes=float(self.config.whipsaw_crossing_window_minutes))
+        while self._spot_price_history and self._spot_price_history[0][0] < cutoff:
+            self._spot_price_history.popleft()
+
+    def _count_threshold_crossings(self, threshold: float, window_minutes: float = 30.0) -> int:
+        cutoff = datetime.now(UTC) - timedelta(minutes=float(window_minutes))
+        recent = [
+            (ts, spot)
+            for ts, spot in self._spot_price_history
+            if ts >= cutoff and spot != threshold
+        ]
+        crossings = 0
+        previous_side: int | None = None
+        for _ts, spot in recent:
+            side = 1 if spot > threshold else -1
+            if previous_side is not None and side != previous_side:
+                crossings += 1
+            previous_side = side
+        return crossings
 
     def _daily_realized_pnl_cents(self, day) -> int:
         return int(sum(trade.realized_pnl_cents for trade in self.closed_trades if trade.closed_at.date() == day))
@@ -1998,8 +2192,17 @@ class LiveTrader:
     def _required_gbm_edge(self, *, strategy_name: str, ask_cents: int) -> float:
         base_edge = self._gbm_min_edge_for_strategy(strategy_name)
         if ask_cents > SOFT_ENTRY_CAP_CENTS:
-            return base_edge + EXPENSIVE_ENTRY_EDGE_PREMIUM
+            base_edge += EXPENSIVE_ENTRY_EDGE_PREMIUM
+        if self._is_overnight_utc():
+            base_edge *= float(self.config.overnight_edge_multiplier)
         return base_edge
+
+    def _is_overnight_utc(self) -> bool:
+        start_hour, end_hour = self.config.overnight_hours_utc
+        current_hour = datetime.now(UTC).hour
+        if start_hour <= end_hour:
+            return start_hour <= current_hour < end_hour
+        return current_hour >= start_hour or current_hour < end_hour
 
     @staticmethod
     def _extract_settlement_price(market: dict[str, Any]) -> float | None:
@@ -2050,7 +2253,7 @@ class LiveTrader:
             observed_to=observed_at,
         )
         if history.empty or "observed_at" not in history.columns or "spot_price" not in history.columns:
-            return None
+            return self.config.gbm_volatility_floor
         spot = (
             history[["observed_at", "spot_price"]]
             .dropna(subset=["observed_at", "spot_price"])
@@ -2058,23 +2261,23 @@ class LiveTrader:
             .sort_values("observed_at")
         )
         if len(spot) < self.config.gbm_min_points:
-            return None
+            return self.config.gbm_volatility_floor
         price = spot["spot_price"].astype(float).to_numpy()
         times = pd.to_datetime(spot["observed_at"], utc=True)
         log_returns = np.diff(np.log(np.clip(price, 1e-12, None)))
         if len(log_returns) < max(self.config.gbm_min_points - 1, 2):
-            return None
+            return self.config.gbm_volatility_floor
         deltas = np.diff(times.astype("int64")) / 1_000_000_000.0
         positive_deltas = deltas[deltas > 0]
         if len(positive_deltas) == 0:
-            return None
+            return self.config.gbm_volatility_floor
         avg_dt_seconds = float(np.median(positive_deltas))
         if avg_dt_seconds <= 0:
-            return None
+            return self.config.gbm_volatility_floor
         annualization = math.sqrt(31_536_000.0 / avg_dt_seconds)
         sigma = float(np.std(log_returns, ddof=1)) * annualization
         if not math.isfinite(sigma):
-            return None
+            return self.config.gbm_volatility_floor
         return max(sigma, self.config.gbm_volatility_floor)
 
     def _account_position_contracts(self) -> dict[str, int]:
@@ -2093,9 +2296,10 @@ class LiveTrader:
     def _resting_buy_market_tickers(self) -> set[str]:
         # Use the WebSocket fill-feed cache when healthy — avoids a REST round-trip
         # every poll cycle.  Fall back to REST if the feed has not yet connected.
+        ws_result: set[str] | None = None
         if self.fill_feed is not None:
             ws_result = self.fill_feed.get_resting_tickers()
-            if ws_result is not None:
+            if ws_result is not None and not ws_result:
                 return ws_result
 
         active: set[str] = set()
@@ -2108,7 +2312,12 @@ class LiveTrader:
                 if ticker and action == "buy" and status in {"resting", "open", "submitted", "pending"}:
                     active.add(ticker)
         except Exception:
-            pass
+            if ws_result is not None:
+                return ws_result
+
+        if self.fill_feed is not None and ws_result is not None:
+            for ticker in ws_result - active:
+                self.fill_feed.deregister_order(ticker)
 
         return active
 
@@ -2815,6 +3024,13 @@ class LiveTrader:
             refreshed_order = refreshed.get("order", refreshed) if isinstance(refreshed, dict) else {}
             refreshed_status = _extract_order_status(refreshed_order if isinstance(refreshed_order, dict) else {})
             refreshed_filled_contracts = _extract_fill_count(refreshed_order if isinstance(refreshed_order, dict) else {})
+            try:
+                refreshed_fills = self.client.get_fills(order_id=order_id, ticker=snapshot.market_ticker)
+                refreshed_exchange_fills = _filled_contracts_from_fills(refreshed_fills)
+                if refreshed_exchange_fills is not None:
+                    refreshed_filled_contracts = refreshed_exchange_fills
+            except Exception:
+                pass
             attempt_record["post_wait_status"] = refreshed_status or "unknown"
             attempt_record["post_wait_response"] = refreshed
             attempt_record["post_wait_filled_contracts"] = refreshed_filled_contracts

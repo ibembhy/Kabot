@@ -32,24 +32,31 @@ def terminal_probability_above(
     return clamp(norm_cdf(numerator / denom), 0.0, 1.0)
 
 
-def probability_for_snapshot(snapshot: MarketSnapshot, *, volatility: float, drift: float) -> float:
+def probability_for_snapshot(
+    snapshot: MarketSnapshot,
+    *,
+    volatility: float,
+    drift: float,
+    spot_price: float | None = None,
+) -> float:
+    s = spot_price if spot_price is not None else snapshot.spot_price
     t = snapshot.time_to_expiry_years
     if snapshot.contract_type == "threshold":
         if snapshot.threshold is None:
             raise ValueError("threshold contract missing threshold")
-        above = terminal_probability_above(snapshot.spot_price, snapshot.threshold, t, volatility, drift)
+        above = terminal_probability_above(s, snapshot.threshold, t, volatility, drift)
         if snapshot.direction == "below":
             return 1.0 - above
         return above
     if snapshot.contract_type == "range":
         if snapshot.range_low is None or snapshot.range_high is None:
             raise ValueError("range contract missing bounds")
-        lower = terminal_probability_above(snapshot.spot_price, snapshot.range_low, t, volatility, drift)
-        upper = terminal_probability_above(snapshot.spot_price, snapshot.range_high, t, volatility, drift)
+        lower = terminal_probability_above(s, snapshot.range_low, t, volatility, drift)
+        upper = terminal_probability_above(s, snapshot.range_high, t, volatility, drift)
         return clamp(lower - upper, 0.0, 1.0)
     if snapshot.contract_type == "direction":
-        reference = snapshot.threshold if snapshot.threshold is not None else snapshot.spot_price
-        above = terminal_probability_above(snapshot.spot_price, reference, t, volatility, drift)
+        reference = snapshot.threshold if snapshot.threshold is not None else s
+        above = terminal_probability_above(s, reference, t, volatility, drift)
         if snapshot.direction == "down":
             return 1.0 - above
         return above

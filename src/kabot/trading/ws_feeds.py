@@ -253,7 +253,7 @@ class KalshiFillFeed:
     """
 
     # Terminal order states — remove from resting set on any of these.
-    _TERMINAL_STATUSES = {"canceled", "filled", "expired", "settled"}
+    _TERMINAL_STATUSES = {"canceled", "executed", "filled", "expired", "settled", "closed"}
 
     def __init__(self, auth_signer: Any, ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2") -> None:
         self._auth_signer = auth_signer

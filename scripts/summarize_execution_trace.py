@@ -36,6 +36,7 @@ def summarize(events: list[dict]) -> dict:
         by_market[key].append(event)
 
     total_filled = sum(int(event.get("filled_contracts", 0) or 0) for event in completes)
+    entry_filled_contracts = sum(int(event.get("filled_contracts", 0) or 0) for event in fills)
     total_attempts = len(submitted)
     completed_sessions = len(completes)
     successful_sessions = sum(1 for event in completes if int(event.get("filled_contracts", 0) or 0) > 0)
@@ -53,6 +54,7 @@ def summarize(events: list[dict]) -> dict:
         "attempts_submitted": total_attempts,
         "attempts_skipped_no_depth": len(skipped),
         "total_filled_contracts": total_filled,
+        "entry_filled_contracts": entry_filled_contracts,
         "completed_statuses": dict(status_counter),
         "completed_strategies": dict(strategy_counter),
         "ladder_step_submissions": dict(ladder_submits),

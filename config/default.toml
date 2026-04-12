@@ -23,7 +23,7 @@ drift = 0.0
 volatility_floor = 0.05
 
 [signal]
-min_edge = 0.05
+min_edge = 0.02
 min_contract_price_cents = 35
 max_contract_price_cents = 65
 max_spread_cents = 6
