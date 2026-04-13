@@ -1,6 +1,7 @@
 """Volatility estimation for the DAILY profile (KXBTCD hourly contracts).
 
-KXBTCD expires every 60 minutes. The correct vol input is intraday
+KXBTCD has many contracts open simultaneously at different price
+thresholds, all expiring at the same hour (:00). The correct vol input is intraday
 realized vol over a 4-hour lookback of 1-minute Coinbase candles.
 The annualization formula is identical to the existing GOD vol estimator.
 The only differences are a longer lookback and a higher vol floor to

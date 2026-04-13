@@ -780,7 +780,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 daily_fair_value_buffer_cents=3,
                 daily_negative_edge_threshold=-0.04,
                 daily_min_tte_to_exit_minutes=8.0,
-                daily_max_open_markets=1,
+                daily_max_open_markets=3,
                 daily_contracts_per_trade=2,
             ),
         )

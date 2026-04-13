@@ -476,7 +476,7 @@ class LiveTraderConfig:
     daily_fair_value_buffer_cents: int = 3
     daily_negative_edge_threshold: float = -0.04
     daily_min_tte_to_exit_minutes: float = 8.0
-    daily_max_open_markets: int = 1
+    daily_max_open_markets: int = 3
     daily_contracts_per_trade: int = 2
     poll_seconds: int = 10
     max_open_markets: int = 3
