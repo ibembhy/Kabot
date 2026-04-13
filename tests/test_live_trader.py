@@ -462,6 +462,9 @@ def test_available_contracts_uses_reciprocal_fp_book_for_no_buys() -> None:
 
 
 class _StubStore:
+    def insert_market_snapshots(self, snapshots):
+        self.snapshots = list(snapshots)
+
     def load_market_snapshots(self, **kwargs):
         import pandas as pd
 
@@ -522,6 +525,70 @@ class _StubClient:
                 "expiration_time": "2026-04-06T12:04:00Z",
             }
         }
+
+
+def test_god_rejects_impossible_edge_before_order_submit(tmp_path) -> None:
+    class _GodClient(_StubClient):
+        def fetch_spot_price(self):
+            return 72010.0, datetime.now(UTC)
+
+        def get_balance(self) -> dict:
+            return {"balance": 10_000}
+
+    class _CertainModel:
+        def estimate(self, snapshot, *, volatility):
+            return type("Estimate", (), {"probability": 1.0})()
+
+    observed_at = datetime.now(UTC)
+    trace_path = tmp_path / "execution_trace.jsonl"
+    client = _GodClient()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            active_profile="GOD",
+            execution_trace_path=str(trace_path),
+            gbm_min_points=1,
+            max_open_markets=3,
+            max_strategy_open_counts={"yes_continuation_mid": 3},
+            min_market_volume=1000.0,
+            distance_threshold_dollars=6.0,
+        ),
+    )
+    trader.model = _CertainModel()  # type: ignore[assignment]
+    trader.state_store.update_metadata(
+        raw_markets=[
+            {
+                "ticker": "TEST",
+                "series_ticker": "KXBTC15M",
+                "market_type": "binary",
+                "yes_bid_dollars": "0.59",
+                "yes_ask_dollars": "0.60",
+                "no_bid_dollars": "0.40",
+                "no_ask_dollars": "0.41",
+                "floor_strike": "72000",
+                "volume": 10_000,
+                "close_time": (observed_at + timedelta(minutes=4)).isoformat(),
+            }
+        ],
+        observed_at=observed_at,
+    )
+    trader._market_metadata = dict(trader.state_store._metadata)  # type: ignore[attr-defined]
+    trader._account_position_contracts = lambda: {}  # type: ignore[method-assign]
+    trader._resting_buy_market_tickers = lambda: []  # type: ignore[method-assign]
+    trader._sync_local_positions = lambda **_kwargs: None  # type: ignore[method-assign]
+    trader._reconcile_settled_positions = lambda _observed_at: []  # type: ignore[method-assign]
+    trader._estimate_live_volatility = lambda **_kwargs: 0.4  # type: ignore[method-assign]
+
+    result = trader.run_once()
+
+    assert result["orders_placed"] == 0
+    assert client.create_payloads == []
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    rejected = [event for event in events if event["event"] == "impossible_edge_rejected"]
+    assert rejected
+    assert rejected[0]["gbm_probability"] == 1.0
+    assert rejected[0]["price_cents"] == 60
 
 
 def test_signal_break_exit_closes_local_position_when_enabled() -> None:
@@ -1028,6 +1095,68 @@ def test_cancel_resting_entry_on_max_age() -> None:
     assert client.canceled == ["rest-2"]
 
 
+def test_hybrid_resting_entry_cancels_on_short_ioc_max_age() -> None:
+    class _CancelClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.canceled: list[str] = []
+
+        def cancel_order(self, order_id: str) -> dict:
+            self.canceled.append(order_id)
+            return {"order_id": order_id, "status": "canceled"}
+
+        def list_orders(self, status: str | None = None) -> dict:
+            return {"orders": [{"order_id": "rest-hybrid", "ticker": "OPEN-NO", "action": "buy"}]}
+
+    client = _CancelClient()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            entry_time_in_force="immediate_or_cancel",
+            hybrid_resting_entry_enabled=True,
+            hybrid_resting_entry_seconds=5.0,
+            resting_entry_max_age_seconds=30.0,
+            distance_threshold_dollars=7.0,
+            gbm_min_points=3,
+        ),
+    )
+    observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    trader.local_resting_entry_locks["OPEN-NO"] = LocalRestingEntryLock(
+        created_at=observed_at - timedelta(seconds=6),
+        side="no",
+        strategy_name="no_continuation_mid",
+        price_cents=50,
+        gbm_edge=0.03,
+        observed_at=observed_at - timedelta(seconds=6),
+    )
+    snapshot = MarketSnapshot(
+        source="test",
+        series_ticker="KXBTC15M",
+        market_ticker="OPEN-NO",
+        contract_type="threshold",
+        underlying_symbol="BTC-USD",
+        observed_at=observed_at,
+        expiry=observed_at + timedelta(minutes=6),
+        spot_price=67980.0,
+        threshold=68000.0,
+        yes_bid=0.55,
+        yes_ask=0.56,
+        no_bid=0.44,
+        no_ask=0.45,
+        volume=10000.0,
+    )
+
+    trader._cancel_stale_resting_entry_orders(
+        observed_at=observed_at,
+        snapshots=[snapshot],
+        volatility=0.3,
+    )
+
+    assert "OPEN-NO" not in trader.local_resting_entry_locks
+    assert client.canceled == ["rest-hybrid"]
+
+
 def test_submit_order_can_use_execution_session_and_write_trace(monkeypatch, tmp_path: Path) -> None:
     class _ExecutionClient(_StubClient):
         def create_order(self, payload: dict) -> dict:
@@ -1518,6 +1647,71 @@ def test_execution_session_registers_local_resting_lock_for_gtc_entry() -> None:
     assert client.create_payloads[0]["count"] == 4
     assert result["status"] == "resting"
     assert "TEST" in trader.local_resting_entry_locks
+
+
+def test_ioc_execution_session_posts_short_hybrid_resting_fallback(monkeypatch, tmp_path: Path) -> None:
+    class _HybridClient(_StubClient):
+        def create_order(self, payload: dict) -> dict:
+            self.created += 1
+            self.create_payloads.append(payload)
+            if payload["time_in_force"] == "good_till_canceled":
+                return {"order": {"order_id": f"order-{self.created}", "status": "resting", "fill_count_fp": "0.00"}}
+            return {"order": {"order_id": f"order-{self.created}", "status": "canceled", "fill_count_fp": "0.00"}}
+
+    client = _HybridClient()
+    trace_path = tmp_path / "execution_trace.jsonl"
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            dry_run=False,
+            enable_execution_sessions=True,
+            use_orderbook_precheck=False,
+            entry_time_in_force="immediate_or_cancel",
+            hybrid_resting_entry_enabled=True,
+            hybrid_resting_entry_seconds=5.0,
+            execution_cross_cents=2,
+            execution_session_attempts=2,
+            execution_session_retry_delay_seconds=0.0,
+            execution_trace_path=str(trace_path),
+            gbm_min_points=3,
+        ),
+    )
+    monkeypatch.setattr("kabot.trading.live_trader.time.sleep", lambda *_args, **_kwargs: None)
+    snapshot = _snapshot(
+        market_ticker="TEST",
+        minutes_to_expiry=4.0,
+        spot_price=68020.0,
+        threshold=68000.0,
+        yes_bid=0.44,
+        yes_ask=0.45,
+    )
+    candidate = StrategyCandidate(
+        strategy_name="yes_continuation_mid",
+        confidence="high",
+        snapshot=snapshot,
+        side="yes",
+        price_cents=45,
+        contracts=2,
+        gbm_probability=0.7,
+        gbm_edge=0.25,
+    )
+    monkeypatch.setattr(trader, "_refresh_candidate_from_live_state", lambda **_kwargs: candidate)
+
+    result = trader._submit_order(candidate)
+
+    assert [payload["time_in_force"] for payload in client.create_payloads] == [
+        "immediate_or_cancel",
+        "immediate_or_cancel",
+        "good_till_canceled",
+    ]
+    assert client.create_payloads[-1]["yes_price"] == 47
+    assert result["status"] == "resting"
+    assert result["filled_contracts"] == 0
+    assert "TEST" in trader.local_resting_entry_locks
+    assert trader.local_resting_entry_locks["TEST"].price_cents == 47
+    lines = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert "execution_hybrid_resting_submitted" in [line["event"] for line in lines]
 
 
 def test_local_resting_entry_lock_expires_without_exchange_confirmation() -> None:

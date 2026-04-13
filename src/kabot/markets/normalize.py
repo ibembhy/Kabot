@@ -52,6 +52,32 @@ def _infer_direction(raw_market: Mapping[str, object]) -> str | None:
     return None
 
 
+def _is_btc_market(raw_market: Mapping[str, object], underlying_symbol: str) -> bool:
+    identifiers = [
+        underlying_symbol,
+        str(_coalesce(raw_market, "series_ticker", "seriesTicker", "series") or ""),
+        str(_coalesce(raw_market, "ticker", "market_ticker") or ""),
+    ]
+    return any("BTC" in value.upper() for value in identifiers)
+
+
+def _validate_threshold(
+    *,
+    raw_market: Mapping[str, object],
+    threshold: float | None,
+    spot_price: float,
+    underlying_symbol: str,
+) -> None:
+    if threshold is None or not _is_btc_market(raw_market, underlying_symbol):
+        return
+    if threshold < spot_price * 0.5 or threshold > spot_price * 1.5:
+        ticker = str(_coalesce(raw_market, "ticker", "market_ticker") or "")
+        raise ValueError(
+            f"Invalid BTC threshold for {ticker or 'market'}: "
+            f"threshold={threshold} spot_price={spot_price}"
+        )
+
+
 def normalize_market(
     raw_market: Mapping[str, object],
     *,
@@ -73,6 +99,13 @@ def normalize_market(
     if expiry_raw is None:
         raise ValueError("Market missing expiry")
     threshold = _coalesce(raw_market, "threshold", "strike", "floor_strike")
+    threshold_value = None if threshold is None else float(threshold)
+    _validate_threshold(
+        raw_market=raw_market,
+        threshold=threshold_value,
+        spot_price=float(spot_price),
+        underlying_symbol=underlying_symbol,
+    )
     range_low = _coalesce(raw_market, "range_low", "floor", "lower_bound")
     range_high = _coalesce(raw_market, "range_high", "cap", "upper_bound")
     settlement_price_raw = _coalesce(raw_market, "settlement_price", "settlement_value", "final_price")
@@ -87,7 +120,7 @@ def normalize_market(
         observed_at=_ensure_utc(observed_at),
         expiry=_ensure_utc(expiry_raw),
         spot_price=float(spot_price),
-        threshold=None if threshold is None else float(threshold),
+        threshold=threshold_value,
         range_low=None if range_low is None else float(range_low),
         range_high=None if range_high is None else float(range_high),
         direction=_infer_direction(raw_market),

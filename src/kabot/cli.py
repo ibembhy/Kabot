@@ -99,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--strategy-mode", choices=["hold_to_settlement", "trade_exit"], default="hold_to_settlement")
     backtest.add_argument("--observed-from", help="Optional inclusive UTC timestamp")
     backtest.add_argument("--observed-to", help="Optional inclusive UTC timestamp")
+    backtest.add_argument("--volatility-override", type=float, help="Use this fixed annualized volatility for every backtest signal")
 
     robustness = subparsers.add_parser("run-robustness-suite", help="Run robustness diagnostics on existing backtest data")
     robustness.add_argument("--config", help="Optional TOML config override path")
@@ -116,12 +117,26 @@ def build_parser() -> argparse.ArgumentParser:
     live_trade.add_argument(
         "--profile",
         default="baseline_live",
-        choices=("baseline_live", "exp_12m_signal_break", "exp_12m_signal_break_execution", "exp_fills2"),
+        choices=(
+            "baseline_live",
+            "exp_12m_signal_break",
+            "exp_12m_signal_break_execution",
+            "exp_fills2",
+            "GOD",
+            "NEW",
+            "DAILY",
+        ),
         help=(
             "Named live profile. baseline_live keeps the current bot. "
             "exp_12m_signal_break enables the 12-minute strategy with signal-break exits. "
             "exp_12m_signal_break_execution runs that same strategy with the execution-session engine and no REST depth precheck. "
-            "exp_fills2 uses a 10-minute window, looser distance, and a controlled execution ladder."
+            "exp_fills2 uses a 10-minute window, looser distance, and a controlled execution ladder. "
+            "GOD mirrors exp_fills2 with Coinbase volatility bootstrap and no orderbook precheck. "
+            "NEW runs both hold-to-settlement (Strategy A) and fade-the-fast-move (Strategy B) "
+            "with a bootstrapped volatility floor and no orderbook precheck. "
+            "DAILY trades KXBTCD (hourly BTC contracts expiring at :00 each hour) "
+            "using GTC limit orders as maker. Targets 65c+ contracts with early "
+            "exit logic. Runs as separate service alongside GOD."
         ),
     )
     live_trade.add_argument("--series", default="KXBTC15M", help="Series ticker, default KXBTC15M")
@@ -233,6 +248,24 @@ def _features_from_snapshots(snapshots: pd.DataFrame, *, volatility_window: int,
     spot["low"] = spot["close"]
     spot["volume"] = 0.0
     return build_feature_frame(spot, volatility_window=volatility_window, annualization_factor=annualization_factor)
+
+
+def _constant_volatility_features(snapshots: pd.DataFrame, *, volatility: float) -> pd.DataFrame:
+    """Build a feature frame that forces one realized volatility value."""
+    if snapshots.empty or "observed_at" not in snapshots.columns:
+        return pd.DataFrame()
+    observed_at = (
+        pd.to_datetime(snapshots["observed_at"], utc=True, errors="coerce")
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    if observed_at.empty:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {"realized_volatility": float(volatility)},
+        index=pd.DatetimeIndex(observed_at, name="ts"),
+    )
 
 
 def _merge_snapshots_with_settlements(snapshots: pd.DataFrame, settlements: pd.DataFrame) -> pd.DataFrame:
@@ -443,6 +476,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 volatility_window=int(settings.data["volatility_window"]),
                 annualization_factor=float(settings.data["annualization_factor"]),
             )
+        if args.volatility_override is not None:
+            features = _constant_volatility_features(snapshots, volatility=float(args.volatility_override))
         engine = BacktestEngine(
             model=GBMThresholdModel(
                 drift=float(settings.model["drift"]),
@@ -599,16 +634,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         settings = load_settings(args.config)
         store = PostgresStore(settings.storage["db_dsn"])
         profile = str(args.profile)
+        uses_fills2_profile = profile in {"exp_fills2", "GOD"}
         uses_12m_strategy = profile in {"exp_12m_signal_break", "exp_12m_signal_break_execution"}
-        uses_fills2 = profile == "exp_fills2"
+        uses_fills2 = uses_fills2_profile
         entry_max_tte_minutes = 14.0 if uses_fills2 else (12.0 if uses_12m_strategy else 10.0)
         enable_signal_break_exit = uses_12m_strategy
-        enable_execution_sessions = profile in {"exp_12m_signal_break_execution", "exp_fills2"}
+        enable_execution_sessions = profile in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"}
         enable_signal_break_reentry = False
-        use_orderbook_precheck = profile not in {"exp_12m_signal_break_execution", "exp_fills2"}
-        entry_time_in_force = "good_till_canceled" if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else "immediate_or_cancel"
-        execution_cross_cents = 0 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 6
-        min_market_volume = 1000.0 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 5000.0
+        use_orderbook_precheck = profile not in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"}
+        entry_time_in_force = "good_till_canceled" if profile in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"} else "immediate_or_cancel"
+        execution_cross_cents = 0 if profile in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"} else 6
+        min_market_volume = 1000.0 if profile in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"} else 5000.0
         exit_cross_cents = 4 if (uses_12m_strategy or uses_fills2) else 1
         exit_distance_threshold_dollars = 0.0 if uses_fills2 else (3.0 if uses_12m_strategy else 10.0)
         signal_break_confirmation_cycles = 3 if (uses_12m_strategy or uses_fills2) else 1
@@ -617,8 +653,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         price_stop_grace_seconds = 90 if (uses_12m_strategy or uses_fills2) else 0
         price_stop_confirm_cycles = 3 if (uses_12m_strategy or uses_fills2) else 1
         hard_stop_cents = 22 if (uses_12m_strategy or uses_fills2) else 0
-        reentry_edge_premium = 0.01 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 0.02
-        reentry_min_price_improvement_cents = 1 if profile in {"exp_12m_signal_break_execution", "exp_fills2"} else 3
+        reentry_edge_premium = 0.01 if profile in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"} else 0.02
+        reentry_min_price_improvement_cents = 1 if profile in {"exp_12m_signal_break_execution", "exp_fills2", "GOD"} else 3
         distance_threshold_dollars = 6.0 if uses_fills2 else 10.0
         execution_ladder_steps_cents = (1, 2, 3, 4) if uses_fills2 else None
         execution_ladder_steps_cents_high = (2, 3, 4, 5) if uses_fills2 else None
@@ -633,14 +669,36 @@ def main(argv: Sequence[str] | None = None) -> None:
         execution_spread_wide_cents = 6 if uses_fills2 else 6
         execution_spread_tight_min_cross_cents = 2 if uses_fills2 else 2
         execution_spread_wide_max_cross_cents = 1 if uses_fills2 else 1
-        execution_ladder_delay_high_seconds = 5.0 if uses_fills2 else 5.0
-        execution_ladder_delay_mid_seconds = 8.0 if uses_fills2 else 8.0
-        execution_ladder_delay_low_seconds = 12.0 if uses_fills2 else 12.0
+        execution_ladder_delay_high_seconds = 0.5 if profile == "GOD" else (5.0 if uses_fills2 else 5.0)
+        execution_ladder_delay_mid_seconds = 0.8 if profile == "GOD" else (8.0 if uses_fills2 else 8.0)
+        execution_ladder_delay_low_seconds = 1.2 if profile == "GOD" else (12.0 if uses_fills2 else 12.0)
         fast_market_tte_minutes = 5.0 if uses_fills2 else 5.0
         fast_market_delay_ceiling_seconds = 6.0 if uses_fills2 else 6.0
         resting_entry_max_age_seconds = 20.0 if uses_fills2 else 45.0
         resting_entry_max_age_seconds_high = 40.0 if uses_fills2 else 90.0
         edge_decay_cancel_threshold = 0.02 if uses_fills2 else 0.02
+        is_new_profile = profile == "NEW"
+        if is_new_profile:
+            entry_max_tte_minutes = 14.0
+            use_orderbook_precheck = False
+            entry_time_in_force = "immediate_or_cancel"
+            enable_signal_break_exit = False
+            enable_execution_sessions = False
+            gbm_min_edge_mid = 0.08
+            gbm_min_edge_wide_yes = 0.08
+            min_market_volume = 1000.0
+            execution_cross_cents = 0
+            distance_threshold_dollars = 0.0
+        is_daily_profile = profile == "DAILY"
+        if is_daily_profile:
+            args.series = "KXBTCD"
+            entry_time_in_force = "good_till_canceled"
+            use_orderbook_precheck = False
+            enable_execution_sessions = False
+            enable_signal_break_exit = False
+            min_market_volume = 500.0
+            gbm_min_edge_mid = 0.06
+            gbm_min_edge_wide_yes = 0.06
         trader = build_live_trader(
             store=store,
             config=LiveTraderConfig(
@@ -667,6 +725,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 enable_signal_break_reentry=enable_signal_break_reentry,
                 use_orderbook_precheck=use_orderbook_precheck,
                 entry_time_in_force=entry_time_in_force,
+                hybrid_resting_entry_enabled=False,
+                hybrid_resting_entry_seconds=5.0,
                 execution_cross_cents=execution_cross_cents,
                 execution_ladder_steps_cents=execution_ladder_steps_cents,
                 execution_ladder_steps_cents_high=execution_ladder_steps_cents_high,
@@ -688,9 +748,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 hard_stop_cents=hard_stop_cents,
                 reentry_edge_premium=reentry_edge_premium,
                 reentry_min_price_improvement_cents=reentry_min_price_improvement_cents,
-        execution_session_attempts=4 if uses_fills2 else 1,
-        execution_session_retry_delay_seconds=2.0 if uses_fills2 else 0.05,
-        failed_entry_backoff_seconds=10.0 if uses_fills2 else 30.0,
+                execution_session_attempts=5 if profile == "GOD" else (4 if uses_fills2 else 1),
+                execution_session_retry_delay_seconds=2.0 if uses_fills2 else 0.05,
+                failed_entry_backoff_seconds=10.0 if uses_fills2 else 30.0,
                 failed_entry_backoff_after_attempts=5 if uses_fills2 else 3,
                 execution_spread_tight_cents=execution_spread_tight_cents,
                 execution_spread_wide_cents=execution_spread_wide_cents,
@@ -705,7 +765,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 resting_entry_max_age_seconds_high=resting_entry_max_age_seconds_high,
                 edge_decay_cancel_threshold=edge_decay_cancel_threshold,
                 max_contracts_per_order=2,
+                max_contracts_per_market=4,
                 min_orderbook_fill_fraction=0.0 if uses_fills2 else 0.5,
+                daily_vol_floor=0.40,
+                daily_min_edge=0.06,
+                daily_min_price_cents=65,
+                daily_max_price_cents=95,
+                daily_min_tte_minutes=8.0,
+                daily_max_tte_minutes=50.0,
+                daily_min_distance_dollars=200.0,
+                daily_max_spread_cents=6,
+                daily_min_volume=500.0,
+                daily_stop_loss_cents=15,
+                daily_fair_value_buffer_cents=3,
+                daily_negative_edge_threshold=-0.04,
+                daily_min_tte_to_exit_minutes=8.0,
+                daily_max_open_markets=1,
+                daily_contracts_per_trade=2,
             ),
         )
         if args.once:

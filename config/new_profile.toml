@@ -1,0 +1,12 @@
+# NEW profile config overrides
+# Used with: kabot run-backtest --config config/new_profile.toml
+
+[backtest]
+fee_rate_bps = 70.0
+entry_slippage_cents = 1
+exit_slippage_cents = 1
+
+[signal]
+min_edge = 0.08
+min_contract_price_cents = 20
+max_contract_price_cents = 80

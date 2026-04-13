@@ -20,11 +20,27 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from kabot.compat import UTC
 from kabot.markets.normalize import normalize_market
-from kabot.models.gbm_threshold import GBMThresholdModel
+from kabot.models.gbm_threshold import GBMThresholdModel, probability_for_snapshot
 from kabot.models.latency_repricing import LatencyRepricingModel
 from kabot.storage.postgres import PostgresStore
+from kabot.trading.daily_strategies import (
+    DailyExitConfig,
+    DailySignal,
+    DailySignalConfig,
+    evaluate_daily_exit,
+    evaluate_daily_signal,
+)
+from kabot.trading.daily_vol import bootstrap_hourly_vol, estimate_hourly_vol_from_db
 from kabot.trading.execution_state import ExecutionStateStore
 from kabot.trading.execution_trace import ExecutionTraceWriter
+from kabot.trading.new_strategies import (
+    NewSignal,
+    StrategyAConfig,
+    StrategyBConfig,
+    evaluate_strategy_a,
+    evaluate_strategy_b,
+)
+from kabot.trading.velocity import BTCVelocityDetector
 from kabot.trading.ws_feeds import CoinbaseSpotFeed, KalshiFillFeed, KalshiTickerFeed
 from kabot.types import MarketSnapshot, Position
 
@@ -57,6 +73,7 @@ class StrategyCandidate:
     contracts: int
     gbm_probability: float | None = None
     gbm_edge: float | None = None
+    time_in_force: str | None = None
 
 
 @dataclass(frozen=True)
@@ -446,6 +463,21 @@ def summarize_rejections(
 class LiveTraderConfig:
     active_profile: str = "baseline_live"
     series_ticker: str = "KXBTC15M"
+    daily_vol_floor: float = 0.40
+    daily_min_edge: float = 0.06
+    daily_min_price_cents: int = 65
+    daily_max_price_cents: int = 95
+    daily_min_tte_minutes: float = 8.0
+    daily_max_tte_minutes: float = 50.0
+    daily_min_distance_dollars: float = 200.0
+    daily_max_spread_cents: int = 6
+    daily_min_volume: float = 500.0
+    daily_stop_loss_cents: int = 15
+    daily_fair_value_buffer_cents: int = 3
+    daily_negative_edge_threshold: float = -0.04
+    daily_min_tte_to_exit_minutes: float = 8.0
+    daily_max_open_markets: int = 1
+    daily_contracts_per_trade: int = 2
     poll_seconds: int = 10
     max_open_markets: int = 3
     contracts_per_trade: int = 1
@@ -527,6 +559,8 @@ class LiveTraderConfig:
     max_entry_retries: int = 1
     entry_time_in_force: str = "immediate_or_cancel"
     exit_time_in_force: str = "immediate_or_cancel"
+    hybrid_resting_entry_enabled: bool = False
+    hybrid_resting_entry_seconds: float = 5.0
     metadata_refresh_seconds: int = 60
     whipsaw_crossing_window_minutes: float = 30.0
     whipsaw_max_crossings: int = 999999
@@ -962,6 +996,12 @@ class LiveTrader:
         self.consecutive_losses = 0
         self.cooldown_until: datetime | None = None
         self._load_loss_streak_state()
+        self._velocity_detector = BTCVelocityDetector(window_seconds=30.0, min_points=3)
+        self._bootstrapped_vol: float | None = None
+        self._daily_vol: float | None = None
+        self._daily_positions: dict[str, Position] = {}
+        self._daily_position_fair_values: dict[str, int] = {}
+        self._daily_closed_trades: list[ClosedTrade] = []
         # WebSocket feeds — started in run_forever()
         self.spot_feed = CoinbaseSpotFeed()
         auth_signer = getattr(client, "auth_signer", None)
@@ -1036,6 +1076,10 @@ class LiveTrader:
     def run_forever(self) -> None:
         self._refresh_market_metadata()
         self._recover_orphaned_positions()
+        if self.config.active_profile in {"NEW", "GOD"}:
+            self._bootstrap_vol_from_coinbase()
+        if self.config.active_profile == "DAILY":
+            self._bootstrap_daily_vol()
         self.spot_feed.start()
         if self.ticker_feed is not None:
             self.ticker_feed.start()
@@ -1073,7 +1117,8 @@ class LiveTrader:
 
     def run_once(self) -> dict[str, Any]:
         observed_at = datetime.now(UTC)
-        strategy_rules = self._strategy_rules()
+        if self.config.active_profile == "DAILY" and self._daily_vol is None:
+            self._bootstrap_daily_vol()
         closed_now = self._reconcile_settled_positions(observed_at)
         ws_spot, ws_spot_ts = self.spot_feed.get()
         if ws_spot is not None and ws_spot_ts is not None:
@@ -1091,6 +1136,8 @@ class LiveTrader:
                 "reject_summary": {"stale_spot": 1},
             }
         self._append_spot_price_history(observed_at=observed_at, spot_price=spot_price)
+        if self.config.active_profile == "NEW":
+            self._velocity_detector.update(observed_at, spot_price)
 
         if self.cooldown_until is not None and observed_at < self.cooldown_until:
             return {
@@ -1174,7 +1221,84 @@ class LiveTrader:
             )
             sample_market = self._sample_market_view(snapshot=chosen_snapshot)
         fresh_snapshots = list(snapshots)
-        volatility = self._estimate_live_volatility(observed_at=observed_at)
+        volatility = None
+        if self.config.active_profile != "DAILY":
+            volatility = self._estimate_live_volatility(observed_at=observed_at)
+        if self.config.active_profile == "NEW":
+            if volatility is None:
+                volatility = self._bootstrapped_vol or self.config.gbm_volatility_floor
+            new_orders = self._run_new_profile_cycle(
+                snapshots=fresh_snapshots,
+                volatility=volatility,
+                observed_at=observed_at,
+                reject_summary=reject_summary,
+            )
+            velocity = self._velocity_detector.reading()
+            return {
+                "observed_at": observed_at.isoformat(),
+                "active_profile": self.config.active_profile,
+                "series_ticker": self.config.series_ticker,
+                "spot_price": spot_price,
+                "spot_timestamp": spot_timestamp.isoformat(),
+                "snapshots_seen": len(snapshots),
+                "fresh_snapshots_seen": len(fresh_snapshots),
+                "active_markets": len(self.local_positions),
+                "candidates": len(new_orders),
+                "orders_placed": len([order for order in new_orders if order.get("filled_contracts", 0) > 0]),
+                "placed_orders": new_orders,
+                "available_balance_cents": available_balance_cents,
+                "estimated_bankroll_cents": bankroll_cents,
+                "local_deployed_cents": deployed_cents,
+                "velocity_bps_per_second": round(velocity.bps_per_second, 2),
+                "velocity_move_bps": round(velocity.move_bps, 2),
+                "gbm_volatility": volatility,
+                "daily_realized_pnl_cents": self._daily_realized_pnl_cents(observed_at.date()),
+                "daily_trade_count": self._daily_trade_count(observed_at.date()),
+                "closed_positions": [closed.__dict__ for closed in closed_now],
+                "reject_summary": reject_summary,
+                "sample_market": sample_market,
+                "dry_run": self.config.dry_run,
+            }
+        if self.config.active_profile == "DAILY":
+            daily_orders = self._run_daily_profile_cycle(
+                snapshots=fresh_snapshots,
+                observed_at=observed_at,
+            )
+            daily_pnl_cents = sum(
+                trade.realized_pnl_cents
+                for trade in self._daily_closed_trades
+                if trade.closed_at.date() == observed_at.date()
+            )
+            return {
+                "observed_at": observed_at.isoformat(),
+                "active_profile": self.config.active_profile,
+                "series_ticker": self.config.series_ticker,
+                "spot_price": spot_price,
+                "spot_timestamp": spot_timestamp.isoformat(),
+                "snapshots_seen": len(snapshots),
+                "fresh_snapshots_seen": len(fresh_snapshots),
+                "active_markets": len([
+                    position
+                    for position in self._daily_positions.values()
+                    if position.status == "open"
+                ]),
+                "candidates": len(daily_orders),
+                "orders_placed": len([
+                    order
+                    for order in daily_orders
+                    if order.get("filled_contracts", 0) > 0
+                ]),
+                "placed_orders": daily_orders,
+                "daily_vol": self._estimate_daily_vol(observed_at=observed_at),
+                "daily_realized_pnl_cents": daily_pnl_cents,
+                "closed_positions": [
+                    trade.__dict__
+                    for trade in self._daily_closed_trades
+                    if trade.closed_at.date() == observed_at.date()
+                ],
+                "dry_run": self.config.dry_run,
+            }
+        strategy_rules = self._strategy_rules()
         signal_break_orders = self._reconcile_signal_break_positions(
             observed_at=observed_at,
             snapshots=fresh_snapshots,
@@ -1260,6 +1384,22 @@ class LiveTrader:
             )
             if edge < min_edge:
                 _increment_reason(reject_summary, "gbm_edge_below_threshold")
+                continue
+            if self.config.active_profile == "GOD" and side_probability >= 0.99 and candidate.price_cents < 95:
+                _increment_reason(reject_summary, "impossible_edge_rejected")
+                self._trace_execution_event(
+                    {
+                        "event": "impossible_edge_rejected",
+                        "market_ticker": candidate.snapshot.market_ticker,
+                        "side": candidate.side,
+                        "strategy_name": candidate.strategy_name,
+                        "price_cents": candidate.price_cents,
+                        "gbm_probability": side_probability,
+                        "gbm_edge": edge,
+                        "threshold": candidate.snapshot.threshold,
+                        "spot_price": candidate.snapshot.spot_price,
+                    }
+                )
                 continue
             gbm_filtered.append(
                 StrategyCandidate(
@@ -1441,6 +1581,7 @@ class LiveTrader:
                 for key in (
                     "side",
                     "status",
+                    "strategy",
                     "strategy_name",
                     "confidence",
                     "gbm_edge",
@@ -1608,8 +1749,6 @@ class LiveTrader:
         volatility: float | None,
     ) -> None:
         """Cancel resting GTC entry orders whose signal has broken since posting."""
-        if self.config.entry_time_in_force == "immediate_or_cancel":
-            return
         if not self.local_resting_entry_locks:
             return
         snapshots_by_ticker = {s.market_ticker: s for s in snapshots}
@@ -1632,6 +1771,8 @@ class LiveTrader:
                     and distance >= float(self.config.high_conviction_distance_threshold_dollars)
                 )
             max_age = float(self.config.resting_entry_max_age_seconds_high if is_high_conviction else self.config.resting_entry_max_age_seconds)
+            if self.config.hybrid_resting_entry_enabled and self.config.entry_time_in_force == "immediate_or_cancel":
+                max_age = min(max_age, float(self.config.hybrid_resting_entry_seconds))
             tte_minutes = max((snapshot.expiry - observed_at).total_seconds() / 60.0, 0.0)
             if tte_minutes <= float(self.config.fast_cancel_tte_minutes):
                 max_age = min(max_age, float(self.config.resting_entry_max_age_seconds_fast))
@@ -2245,6 +2386,62 @@ class LiveTrader:
             "tte_s": max(int((snapshot.expiry - snapshot.observed_at).total_seconds()), 0),
         }
 
+    def _bootstrap_vol_from_coinbase(self) -> None:
+        """Fetch recent Coinbase candles and compute realized vol for selected startup profiles."""
+        end = datetime.now(UTC)
+        start = end - timedelta(minutes=90)
+        try:
+            response = self.client.session.get(
+                "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                params={
+                    "granularity": 60,
+                    "start": start.isoformat().replace("+00:00", "Z"),
+                    "end": end.isoformat().replace("+00:00", "Z"),
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            candles = response.json()
+            if not candles or len(candles) < 10:
+                return
+            closes = [float(candle[4]) for candle in sorted(candles, key=lambda candle: candle[0])]
+            log_returns = [
+                math.log(closes[index] / closes[index - 1])
+                for index in range(1, len(closes))
+                if closes[index - 1] > 0 and closes[index] > 0
+            ]
+            if len(log_returns) < 5:
+                return
+            sigma_per_minute = float(np.std(np.array(log_returns), ddof=1))
+            annualized = sigma_per_minute * math.sqrt(525_600.0)
+            if math.isfinite(annualized) and annualized > 0:
+                self._bootstrapped_vol = max(annualized, self.config.gbm_volatility_floor)
+                print(f"[{self.config.active_profile}] Bootstrapped vol from Coinbase: {self._bootstrapped_vol:.4f}", flush=True)
+        except Exception as exc:
+            print(f"[{self.config.active_profile}] Vol bootstrap failed, using floor: {exc}", flush=True)
+
+    def _bootstrap_daily_vol(self) -> None:
+        session = getattr(self.client, "session", None)
+        if session is None:
+            self._daily_vol = self.config.daily_vol_floor
+            print(f"[DAILY] Vol bootstrap failed, using floor: {self._daily_vol:.4f}", flush=True)
+            return
+        result = bootstrap_hourly_vol(
+            session,
+            floor=self.config.daily_vol_floor,
+        )
+        if result is not None:
+            self._daily_vol = result
+            print(f"[DAILY] Bootstrapped vol: {self._daily_vol:.4f}", flush=True)
+        else:
+            self._daily_vol = self.config.daily_vol_floor
+            print(f"[DAILY] Vol bootstrap failed, using floor: {self._daily_vol:.4f}", flush=True)
+
+    def _live_volatility_floor(self) -> float:
+        if self.config.active_profile in {"NEW", "GOD"} and self._bootstrapped_vol is not None:
+            return self._bootstrapped_vol
+        return self.config.gbm_volatility_floor
+
     def _estimate_live_volatility(self, *, observed_at: datetime) -> float | None:
         lookback_start = observed_at - timedelta(minutes=self.config.gbm_lookback_minutes)
         history = self.store.load_market_snapshots(
@@ -2253,7 +2450,7 @@ class LiveTrader:
             observed_to=observed_at,
         )
         if history.empty or "observed_at" not in history.columns or "spot_price" not in history.columns:
-            return self.config.gbm_volatility_floor
+            return self._live_volatility_floor()
         spot = (
             history[["observed_at", "spot_price"]]
             .dropna(subset=["observed_at", "spot_price"])
@@ -2261,24 +2458,39 @@ class LiveTrader:
             .sort_values("observed_at")
         )
         if len(spot) < self.config.gbm_min_points:
-            return self.config.gbm_volatility_floor
+            return self._live_volatility_floor()
         price = spot["spot_price"].astype(float).to_numpy()
         times = pd.to_datetime(spot["observed_at"], utc=True)
         log_returns = np.diff(np.log(np.clip(price, 1e-12, None)))
         if len(log_returns) < max(self.config.gbm_min_points - 1, 2):
-            return self.config.gbm_volatility_floor
+            return self._live_volatility_floor()
         deltas = np.diff(times.astype("int64")) / 1_000_000_000.0
         positive_deltas = deltas[deltas > 0]
         if len(positive_deltas) == 0:
-            return self.config.gbm_volatility_floor
+            return self._live_volatility_floor()
         avg_dt_seconds = float(np.median(positive_deltas))
         if avg_dt_seconds <= 0:
-            return self.config.gbm_volatility_floor
+            return self._live_volatility_floor()
         annualization = math.sqrt(31_536_000.0 / avg_dt_seconds)
         sigma = float(np.std(log_returns, ddof=1)) * annualization
         if not math.isfinite(sigma):
-            return self.config.gbm_volatility_floor
-        return max(sigma, self.config.gbm_volatility_floor)
+            return self._live_volatility_floor()
+        return max(sigma, self._live_volatility_floor())
+
+    def _estimate_daily_vol(self, *, observed_at: datetime) -> float:
+        db_vol = estimate_hourly_vol_from_db(
+            self.store,
+            series_ticker=self.config.series_ticker,
+            observed_at=observed_at,
+            lookback_minutes=240,
+            min_points=20,
+            floor=self.config.daily_vol_floor,
+        )
+        if db_vol > self.config.daily_vol_floor:
+            return db_vol
+        if self._daily_vol is not None:
+            return self._daily_vol
+        return self.config.daily_vol_floor
 
     def _account_position_contracts(self) -> dict[str, int]:
         positions_by_ticker: dict[str, int] = {}
@@ -2400,6 +2612,7 @@ class LiveTrader:
         current_candidate = candidate
         total_filled_contracts = 0
         max_attempts = max(int(self.config.execution_session_attempts), 1)
+        entry_time_in_force = candidate.time_in_force or self.config.entry_time_in_force
         ladder_steps = self.config.execution_ladder_steps_cents
         if ladder_steps is None or len(ladder_steps) == 0:
             ladder_steps = (int(self.config.execution_cross_cents),) * max_attempts
@@ -2586,7 +2799,7 @@ class LiveTrader:
                 step_cents = 1
                 execution_price_cents = min(current_candidate.price_cents + max(step_cents, 0), 99)
             if (
-                self.config.entry_time_in_force != "immediate_or_cancel"
+                entry_time_in_force != "immediate_or_cancel"
                 and attempt_index > 0
                 and last_order_id
             ):
@@ -2614,7 +2827,7 @@ class LiveTrader:
                 "yes_price": execution_price_cents if current_candidate.side == "yes" else None,
                 "no_price": execution_price_cents if current_candidate.side == "no" else None,
                 "client_order_id": f"kabot-exec-{snapshot.market_ticker}-{int(snapshot.observed_at.timestamp())}-{attempt_index}",
-                "time_in_force": self.config.entry_time_in_force,
+                "time_in_force": entry_time_in_force,
             }
             payload = {key: value for key, value in payload.items() if value is not None}
             if self.config.dry_run:
@@ -2640,6 +2853,8 @@ class LiveTrader:
                     "attempts": attempts,
                     "orderbook_available_contracts": orderbook_available_contracts,
                 }
+            submission_ts = datetime.now(UTC)
+            signal_age_ms = int(round((submission_ts - snapshot.observed_at).total_seconds() * 1000.0))
             response = self.client.create_order(payload)
             order_id = _extract_order_id(response)
             response_order = response.get("order", response) if isinstance(response, dict) else {}
@@ -2663,7 +2878,7 @@ class LiveTrader:
             last_execution_price_cents = execution_price_cents
             last_order_id = order_id
             if (
-                self.config.entry_time_in_force != "immediate_or_cancel"
+                entry_time_in_force != "immediate_or_cancel"
                 and order_status in {"resting", "open", "submitted", "pending"}
             ):
                 self.local_resting_entry_locks[snapshot.market_ticker] = LocalRestingEntryLock(
@@ -2709,6 +2924,7 @@ class LiveTrader:
                     "residual_edge": residual_edge,
                     "signal_edge": current_candidate.gbm_edge,
                     "submit_edge": residual_edge,
+                    "signal_age_ms": signal_age_ms,
                 }
             )
             if total_filled_contracts >= int(candidate.contracts) or attempt_index >= max_attempts - 1:
@@ -2737,6 +2953,105 @@ class LiveTrader:
                 )
                 break
             current_candidate = refreshed_candidate
+        if (
+            self.config.hybrid_resting_entry_enabled
+            and entry_time_in_force == "immediate_or_cancel"
+            and total_filled_contracts <= 0
+            and attempts
+            and current_candidate.snapshot.market_ticker not in self.local_resting_entry_locks
+        ):
+            refreshed_candidate = self._refresh_candidate_from_live_state(current_candidate=current_candidate)
+            if refreshed_candidate is not None:
+                current_candidate = refreshed_candidate
+                snapshot = current_candidate.snapshot
+                remaining_contracts = max(int(current_candidate.contracts) - total_filled_contracts, 0)
+                execution_price_cents = min(
+                    current_candidate.price_cents + max(int(self.config.execution_cross_cents), 0),
+                    99,
+                )
+                residual_edge = None
+                if current_candidate.gbm_probability is not None:
+                    residual_edge = float(current_candidate.gbm_probability) - (execution_price_cents / 100.0)
+                    max_cross_from_edge = max(int(math.floor(float(residual_edge) * 100.0)), 0)
+                    cross_cents = min(max(int(self.config.execution_cross_cents), 0), max_cross_from_edge, 3)
+                    execution_price_cents = min(current_candidate.price_cents + max(cross_cents, 0), 99)
+                    residual_edge = float(current_candidate.gbm_probability) - (execution_price_cents / 100.0)
+                if remaining_contracts > 0 and (
+                    residual_edge is None or residual_edge >= float(self.config.execution_min_edge_margin_low)
+                ):
+                    payload = {
+                        "ticker": snapshot.market_ticker,
+                        "action": "buy",
+                        "side": current_candidate.side,
+                        "count": remaining_contracts,
+                        "type": "limit",
+                        "yes_price": execution_price_cents if current_candidate.side == "yes" else None,
+                        "no_price": execution_price_cents if current_candidate.side == "no" else None,
+                        "client_order_id": f"kabot-hybrid-{snapshot.market_ticker}-{int(snapshot.observed_at.timestamp())}",
+                        "time_in_force": "good_till_canceled",
+                    }
+                    payload = {key: value for key, value in payload.items() if value is not None}
+                    response = self.client.create_order(payload)
+                    order_id = _extract_order_id(response)
+                    response_order = response.get("order", response) if isinstance(response, dict) else {}
+                    order_status = _extract_order_status(response_order if isinstance(response_order, dict) else {})
+                    filled_contracts = _extract_fill_count(response_order if isinstance(response_order, dict) else {})
+                    exchange_filled_contracts = None
+                    if order_id:
+                        try:
+                            fills_response = self.client.get_fills(order_id=order_id, ticker=snapshot.market_ticker)
+                            exchange_filled_contracts = _filled_contracts_from_fills(fills_response)
+                        except Exception:
+                            exchange_filled_contracts = None
+                    if exchange_filled_contracts is not None:
+                        filled_contracts = exchange_filled_contracts
+                    total_filled_contracts += filled_contracts
+                    last_status = order_status or "submitted"
+                    last_response = response
+                    last_payload = payload
+                    last_execution_price_cents = execution_price_cents
+                    attempt_record = {
+                        "attempt": len(attempts) + 1,
+                        "signal_price_cents": current_candidate.price_cents,
+                        "execution_price_cents": execution_price_cents,
+                        "payload": payload,
+                        "response": response,
+                        "order_id": order_id,
+                        "status": order_status or "submitted",
+                        "filled_contracts": filled_contracts,
+                        "exchange_filled_contracts": exchange_filled_contracts,
+                        "orderbook_available_contracts": None,
+                        "hybrid_resting_fallback": True,
+                    }
+                    attempts.append(attempt_record)
+                    self._trace_execution_event(
+                        {
+                            "event": "execution_hybrid_resting_submitted",
+                            "market_ticker": snapshot.market_ticker,
+                            "side": current_candidate.side,
+                            "strategy_name": current_candidate.strategy_name,
+                            "signal_price_cents": current_candidate.price_cents,
+                            "execution_price_cents": execution_price_cents,
+                            "status": order_status or "submitted",
+                            "filled_contracts": filled_contracts,
+                            "exchange_filled_contracts": exchange_filled_contracts,
+                            "residual_edge": residual_edge,
+                            "max_age_seconds": self.config.hybrid_resting_entry_seconds,
+                        }
+                    )
+                    if order_status in {"resting", "open", "submitted", "pending"}:
+                        self.local_resting_entry_locks[snapshot.market_ticker] = LocalRestingEntryLock(
+                            created_at=datetime.now(UTC),
+                            side=current_candidate.side,
+                            strategy_name=current_candidate.strategy_name,
+                            price_cents=execution_price_cents,
+                            gbm_edge=current_candidate.gbm_edge,
+                            gbm_probability=current_candidate.gbm_probability,
+                            observed_at=snapshot.observed_at,
+                            contracts=remaining_contracts,
+                        )
+                        if order_id and self.fill_feed is not None:
+                            self.fill_feed.register_order(snapshot.market_ticker, order_id)
         self._trace_execution_event(
             {
                 "event": "execution_session_complete",
@@ -2792,6 +3107,753 @@ class LiveTrader:
         if refreshed_snapshot is None:
             return None
         return self._refresh_candidate(current_candidate=current_candidate, snapshot=refreshed_snapshot)
+
+    def _run_daily_profile_cycle(
+        self,
+        *,
+        snapshots: list[MarketSnapshot],
+        observed_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """DAILY profile: evaluate KXBTCD signals and manage open positions."""
+        volatility = self._estimate_daily_vol(observed_at=observed_at)
+
+        signal_config = DailySignalConfig(
+            min_edge=self.config.daily_min_edge,
+            min_price_cents=self.config.daily_min_price_cents,
+            max_price_cents=self.config.daily_max_price_cents,
+            min_tte_minutes=self.config.daily_min_tte_minutes,
+            max_tte_minutes=self.config.daily_max_tte_minutes,
+            min_distance_dollars=self.config.daily_min_distance_dollars,
+            max_spread_cents=self.config.daily_max_spread_cents,
+            min_volume=self.config.daily_min_volume,
+        )
+
+        exit_config = DailyExitConfig(
+            fair_value_buffer_cents=self.config.daily_fair_value_buffer_cents,
+            negative_edge_threshold=self.config.daily_negative_edge_threshold,
+            min_tte_to_exit_minutes=self.config.daily_min_tte_to_exit_minutes,
+            stop_loss_cents=self.config.daily_stop_loss_cents,
+        )
+
+        results: list[dict[str, Any]] = []
+        snapshots_by_ticker = {snapshot.market_ticker: snapshot for snapshot in snapshots}
+
+        for ticker, position in list(self._daily_positions.items()):
+            if position.status != "open" or position.contracts <= 0:
+                continue
+
+            if position.expiry is not None and position.expiry <= observed_at:
+                result = self._reconcile_daily_settled_position(
+                    ticker=ticker,
+                    position=position,
+                    observed_at=observed_at,
+                )
+                results.append(result)
+                continue
+
+            snapshot = snapshots_by_ticker.get(ticker)
+            if snapshot is None:
+                continue
+
+            fair_value_cents = self._daily_position_fair_values.get(
+                ticker,
+                position.entry_price_cents,
+            )
+            exit_decision = evaluate_daily_exit(
+                snapshot,
+                side=position.side,
+                entry_price_cents=position.entry_price_cents,
+                fair_value_cents=fair_value_cents,
+                contracts=position.contracts,
+                volatility=volatility,
+                observed_at=observed_at,
+                config=exit_config,
+            )
+
+            self._trace_execution_event(
+                {
+                    "event": "daily_exit_evaluated",
+                    "market_ticker": ticker,
+                    "action": exit_decision.action,
+                    "trigger": exit_decision.trigger,
+                    "exit_price_cents": exit_decision.exit_price_cents,
+                    "unrealized_pnl_cents": exit_decision.unrealized_pnl_cents,
+                    "reason": exit_decision.reason,
+                }
+            )
+
+            if exit_decision.action == "exit" and exit_decision.exit_price_cents is not None:
+                order_result = self._submit_daily_exit_order(
+                    position=position,
+                    snapshot=snapshot,
+                    reason=exit_decision.trigger or "unknown",
+                )
+                results.append(order_result)
+                filled = max(int(order_result.get("filled_contracts", 0) or 0), 0)
+                if filled > 0:
+                    pnl_cents = int(
+                        (exit_decision.exit_price_cents - position.entry_price_cents) * filled
+                    )
+                    self._daily_closed_trades.append(
+                        ClosedTrade(
+                            market_ticker=ticker,
+                            strategy_name="daily",
+                            closed_at=observed_at,
+                            realized_pnl_cents=pnl_cents,
+                        )
+                    )
+                    self._trace_execution_event(
+                        {
+                            "event": "daily_exit_filled",
+                            "market_ticker": ticker,
+                            "side": position.side,
+                            "exit_price_cents": exit_decision.exit_price_cents,
+                            "filled_contracts": filled,
+                            "pnl_cents": pnl_cents,
+                            "trigger": exit_decision.trigger,
+                        }
+                    )
+                    remaining = max(position.contracts - filled, 0)
+                    if remaining <= 0:
+                        del self._daily_positions[ticker]
+                        self._daily_position_fair_values.pop(ticker, None)
+                    else:
+                        position.contracts = remaining
+
+        open_daily_count = sum(
+            1 for position in self._daily_positions.values() if position.status == "open"
+        )
+        if open_daily_count >= self.config.daily_max_open_markets:
+            return results
+
+        daily_pnl = sum(
+            trade.realized_pnl_cents
+            for trade in self._daily_closed_trades
+            if trade.closed_at.date() == observed_at.date()
+        )
+        if daily_pnl <= -abs(self.config.daily_loss_stop_cents):
+            return results
+
+        open_daily_tickers = {
+            ticker
+            for ticker, position in self._daily_positions.items()
+            if position.status == "open"
+        }
+        if self.fill_feed is not None:
+            resting_tickers = self.fill_feed.get_resting_tickers()
+            if resting_tickers is not None:
+                open_daily_tickers |= resting_tickers
+
+        for snapshot in snapshots:
+            if snapshot.market_ticker in open_daily_tickers:
+                continue
+            if open_daily_count >= self.config.daily_max_open_markets:
+                break
+
+            signal = evaluate_daily_signal(
+                snapshot,
+                volatility=volatility,
+                config=signal_config,
+                observed_at=observed_at,
+            )
+
+            if signal is None:
+                continue
+
+            self._trace_execution_event(
+                {
+                    "event": "daily_signal",
+                    "market_ticker": signal.market_ticker,
+                    "side": signal.side,
+                    "entry_price_cents": signal.entry_price_cents,
+                    "model_probability": signal.model_probability,
+                    "market_probability": signal.market_probability,
+                    "edge": signal.edge,
+                    "tte_minutes": signal.tte_minutes,
+                    "fair_value_cents": signal.fair_value_cents,
+                    "daily_vol": volatility,
+                    "reason": signal.reason,
+                }
+            )
+
+            order_result = self._submit_daily_entry_order(
+                signal=signal,
+                observed_at=observed_at,
+            )
+            results.append(order_result)
+
+            filled = max(int(order_result.get("filled_contracts", 0) or 0), 0)
+            if filled > 0:
+                open_daily_tickers.add(signal.market_ticker)
+                open_daily_count += 1
+                self._daily_positions[signal.market_ticker] = Position(
+                    position_id=str(uuid4()),
+                    market_ticker=signal.market_ticker,
+                    side=signal.side,
+                    contracts=filled,
+                    entry_time=observed_at,
+                    entry_price_cents=signal.entry_price_cents,
+                    expiry=snapshot.expiry,
+                )
+                self._daily_position_fair_values[signal.market_ticker] = signal.fair_value_cents
+                self._trace_execution_event(
+                    {
+                        "event": "daily_entry_filled",
+                        "market_ticker": signal.market_ticker,
+                        "side": signal.side,
+                        "price_cents": signal.entry_price_cents,
+                        "filled_contracts": filled,
+                        "edge": signal.edge,
+                        "fair_value_cents": signal.fair_value_cents,
+                    }
+                )
+
+        return results
+
+    def _run_new_profile_cycle(
+        self,
+        *,
+        snapshots: list[MarketSnapshot],
+        volatility: float,
+        observed_at: datetime,
+        reject_summary: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """NEW profile: evaluate Strategy A and B signals and submit orders."""
+        strategy_a_config = StrategyAConfig(
+            min_edge=0.08,
+            min_tte_minutes=8.0,
+            max_tte_minutes=14.0,
+            min_price_cents=20,
+            max_price_cents=80,
+            max_spread_cents=8,
+            min_volume=1000.0,
+        )
+        strategy_b_config = StrategyBConfig(
+            min_velocity_bps_per_second=5.0,
+            min_total_move_bps=150.0,
+            min_edge=0.08,
+            min_tte_minutes=4.0,
+            max_tte_minutes=12.0,
+            min_price_cents=15,
+            max_price_cents=85,
+            max_spread_cents=12,
+            min_volume=500.0,
+            vol_spike_multiplier=1.5,
+        )
+
+        velocity = self._velocity_detector.reading()
+        is_fast_move = self._velocity_detector.is_fast_move(
+            min_bps_per_second=strategy_b_config.min_velocity_bps_per_second,
+            min_total_bps=strategy_b_config.min_total_move_bps,
+        )
+        open_tickers = {
+            ticker for ticker, position in self.local_positions.items()
+            if position.status == "open"
+        }
+        orders_placed: list[dict[str, Any]] = []
+
+        for snapshot in snapshots:
+            if snapshot.market_ticker in open_tickers:
+                if reject_summary is not None:
+                    _increment_reason(reject_summary, "has_open_position")
+                continue
+
+            signal: NewSignal | None = None
+            if not is_fast_move:
+                signal = evaluate_strategy_a(
+                    snapshot,
+                    volatility=volatility,
+                    config=strategy_a_config,
+                    observed_at=observed_at,
+                )
+            if signal is None and is_fast_move:
+                signal = evaluate_strategy_b(
+                    snapshot,
+                    base_volatility=volatility,
+                    move_direction=velocity.direction,
+                    move_bps=velocity.move_bps,
+                    config=strategy_b_config,
+                    observed_at=observed_at,
+                )
+            if signal is None:
+                if reject_summary is not None:
+                    _increment_reason(
+                        reject_summary,
+                        self._new_profile_reject_reason(
+                            snapshot=snapshot,
+                            volatility=volatility,
+                            observed_at=observed_at,
+                            is_fast_move=is_fast_move,
+                            velocity_direction=velocity.direction,
+                            strategy_a_config=strategy_a_config,
+                            strategy_b_config=strategy_b_config,
+                        ),
+                    )
+                continue
+
+            self._trace_execution_event(
+                {
+                    "event": "new_profile_signal",
+                    "strategy": signal.strategy,
+                    "market_ticker": signal.market_ticker,
+                    "side": signal.side,
+                    "entry_price_cents": signal.entry_price_cents,
+                    "model_probability": signal.model_probability,
+                    "market_probability": signal.market_probability,
+                    "edge": signal.edge,
+                    "tte_minutes": signal.tte_minutes,
+                    "velocity_bps_per_second": velocity.bps_per_second,
+                    "velocity_move_bps": velocity.move_bps,
+                    "reason": signal.reason,
+                }
+            )
+
+            result = self._submit_new_profile_order(signal=signal, observed_at=observed_at)
+            orders_placed.append(result)
+            filled = max(int(result.get("filled_contracts", 0) or 0), 0)
+            if filled > 0:
+                open_tickers.add(signal.market_ticker)
+                self.local_positions[signal.market_ticker] = Position(
+                    position_id=str(uuid4()),
+                    market_ticker=signal.market_ticker,
+                    side=signal.side,
+                    contracts=filled,
+                    entry_time=observed_at,
+                    entry_price_cents=signal.entry_price_cents,
+                    expiry=snapshot.expiry,
+                )
+                self.position_strategies[signal.market_ticker] = signal.strategy
+
+        return orders_placed
+
+    def _new_profile_reject_reason(
+        self,
+        *,
+        snapshot: MarketSnapshot,
+        volatility: float,
+        observed_at: datetime,
+        is_fast_move: bool,
+        velocity_direction: int,
+        strategy_a_config: StrategyAConfig,
+        strategy_b_config: StrategyBConfig,
+    ) -> str:
+        """Return the first NEW-profile gate that blocks a snapshot."""
+        if snapshot.contract_type != "threshold" or snapshot.threshold is None:
+            return "not_threshold"
+        tte_minutes = max((snapshot.expiry - observed_at).total_seconds() / 60.0, 0.0)
+        if not is_fast_move:
+            return self._new_profile_strategy_a_reject_reason(
+                snapshot=snapshot,
+                volatility=volatility,
+                tte_minutes=tte_minutes,
+                config=strategy_a_config,
+            )
+        return self._new_profile_strategy_b_reject_reason(
+            snapshot=snapshot,
+            volatility=volatility,
+            tte_minutes=tte_minutes,
+            velocity_direction=velocity_direction,
+            config=strategy_b_config,
+        )
+
+    @staticmethod
+    def _new_profile_strategy_a_reject_reason(
+        *,
+        snapshot: MarketSnapshot,
+        volatility: float,
+        tte_minutes: float,
+        config: StrategyAConfig,
+    ) -> str:
+        if (snapshot.volume or 0.0) < config.min_volume:
+            return "volume_below_a"
+        if not (config.min_tte_minutes < tte_minutes <= config.max_tte_minutes):
+            return "tte_outside_a"
+        prob_yes = probability_for_snapshot(snapshot, volatility=max(volatility, 0.05), drift=0.0)
+        saw_quotes = False
+        saw_price_band = False
+        saw_spread = False
+        for model_prob, ask, bid in [
+            (prob_yes, snapshot.yes_ask, snapshot.yes_bid),
+            (1.0 - prob_yes, snapshot.no_ask, snapshot.no_bid),
+        ]:
+            if ask is None or bid is None:
+                continue
+            saw_quotes = True
+            ask_cents = int(round(ask * 100.0))
+            bid_cents = int(round(bid * 100.0))
+            if not (config.min_price_cents <= ask_cents <= config.max_price_cents):
+                continue
+            saw_price_band = True
+            if ask_cents - bid_cents > config.max_spread_cents:
+                continue
+            saw_spread = True
+            if model_prob - ask >= config.min_edge:
+                return "unknown_a"
+        if not saw_quotes:
+            return "missing_quotes_a"
+        if not saw_price_band:
+            return "price_band_a"
+        if not saw_spread:
+            return "spread_wide_a"
+        return "edge_below_a"
+
+    @staticmethod
+    def _new_profile_strategy_b_reject_reason(
+        *,
+        snapshot: MarketSnapshot,
+        volatility: float,
+        tte_minutes: float,
+        velocity_direction: int,
+        config: StrategyBConfig,
+    ) -> str:
+        if velocity_direction == 0:
+            return "no_move_direction_b"
+        if (snapshot.volume or 0.0) < config.min_volume:
+            return "volume_below_b"
+        if not (config.min_tte_minutes < tte_minutes <= config.max_tte_minutes):
+            return "tte_outside_b"
+        sigma = max(volatility * config.vol_spike_multiplier, 0.05)
+        prob_yes = probability_for_snapshot(snapshot, volatility=sigma, drift=0.0)
+        if velocity_direction > 0:
+            model_prob = 1.0 - prob_yes
+            ask = snapshot.no_ask
+            bid = snapshot.no_bid
+        else:
+            model_prob = prob_yes
+            ask = snapshot.yes_ask
+            bid = snapshot.yes_bid
+        if ask is None or bid is None:
+            return "missing_quotes_b"
+        ask_cents = int(round(ask * 100.0))
+        bid_cents = int(round(bid * 100.0))
+        if not (config.min_price_cents <= ask_cents <= config.max_price_cents):
+            return "price_band_b"
+        if ask_cents - bid_cents > config.max_spread_cents:
+            return "spread_wide_b"
+        if model_prob - ask < config.min_edge:
+            return "edge_below_b"
+        return "unknown_b"
+
+    def _submit_daily_entry_order(
+        self,
+        *,
+        signal: DailySignal,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Submit a GTC limit entry order for the DAILY profile."""
+        payload: dict[str, Any] = {
+            "ticker": signal.market_ticker,
+            "action": "buy",
+            "side": signal.side,
+            "count": self.config.daily_contracts_per_trade,
+            "type": "limit",
+            "time_in_force": "good_till_canceled",
+            "client_order_id": (
+                f"kabot-daily-{signal.market_ticker}-{int(observed_at.timestamp())}"
+            ),
+        }
+        if signal.side == "yes":
+            payload["yes_price"] = signal.entry_price_cents
+        else:
+            payload["no_price"] = signal.entry_price_cents
+
+        self._trace_execution_event(
+            {
+                "event": "daily_order_submit",
+                "market_ticker": signal.market_ticker,
+                "side": signal.side,
+                "price_cents": signal.entry_price_cents,
+                "contracts": self.config.daily_contracts_per_trade,
+                "edge": signal.edge,
+            }
+        )
+
+        if self.config.dry_run:
+            return {
+                "status": "dry_run",
+                "market_ticker": signal.market_ticker,
+                "side": signal.side,
+                "price_cents": signal.entry_price_cents,
+                "filled_contracts": 0,
+                "edge": signal.edge,
+                "payload": payload,
+            }
+
+        try:
+            response = self.client.create_order(payload)
+        except Exception as exc:
+            self._trace_execution_event(
+                {
+                    "event": "daily_order_error",
+                    "market_ticker": signal.market_ticker,
+                    "error": str(exc),
+                }
+            )
+            return {
+                "status": "error",
+                "market_ticker": signal.market_ticker,
+                "error": str(exc),
+                "filled_contracts": 0,
+            }
+
+        response_order = response.get("order", response) if isinstance(response, dict) else {}
+        order = response_order if isinstance(response_order, dict) else {}
+        order_status = _extract_order_status(order)
+        order_id = _extract_order_id(response)
+        filled_contracts = _extract_fill_count(order)
+
+        if order_id and self.fill_feed is not None:
+            self.fill_feed.register_order(signal.market_ticker, order_id)
+
+        return {
+            "status": order_status or "submitted",
+            "market_ticker": signal.market_ticker,
+            "side": signal.side,
+            "price_cents": signal.entry_price_cents,
+            "filled_contracts": max(int(filled_contracts), 0),
+            "order_id": order_id,
+            "edge": signal.edge,
+            "response": response,
+        }
+
+    def _submit_daily_exit_order(
+        self,
+        *,
+        position: Position,
+        snapshot: MarketSnapshot,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Submit an IOC sell order for DAILY exit. When exiting, exit fast."""
+        bid = snapshot.yes_bid if position.side == "yes" else snapshot.no_bid
+        if bid is None:
+            return {
+                "status": "no_bid",
+                "market_ticker": position.market_ticker,
+                "filled_contracts": 0,
+                "reason": reason,
+            }
+
+        exit_price_cents = int(round(bid * 100.0))
+
+        payload: dict[str, Any] = {
+            "ticker": position.market_ticker,
+            "action": "sell",
+            "side": position.side,
+            "count": position.contracts,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel",
+            "client_order_id": (
+                f"kabot-daily-exit-{position.market_ticker}"
+                f"-{int(snapshot.observed_at.timestamp())}"
+            ),
+        }
+        if position.side == "yes":
+            payload["yes_price"] = exit_price_cents
+        else:
+            payload["no_price"] = exit_price_cents
+
+        if self.config.dry_run:
+            return {
+                "status": "dry_run",
+                "market_ticker": position.market_ticker,
+                "exit_price_cents": exit_price_cents,
+                "filled_contracts": 0,
+                "reason": reason,
+                "payload": payload,
+            }
+
+        try:
+            response = self.client.create_order(payload)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "market_ticker": position.market_ticker,
+                "error": str(exc),
+                "filled_contracts": 0,
+            }
+
+        response_order = response.get("order", response) if isinstance(response, dict) else {}
+        order = response_order if isinstance(response_order, dict) else {}
+        order_status = _extract_order_status(order)
+        filled_contracts = _extract_fill_count(order)
+
+        return {
+            "status": order_status or "submitted",
+            "market_ticker": position.market_ticker,
+            "exit_price_cents": exit_price_cents,
+            "filled_contracts": max(int(filled_contracts), 0),
+            "reason": reason,
+            "response": response,
+        }
+
+    def _reconcile_daily_settled_position(
+        self,
+        *,
+        ticker: str,
+        position: Position,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Fetch settlement from Kalshi and book PnL for expired DAILY position."""
+        try:
+            payload = self.client.get_market(ticker)
+            market = payload.get("market") if isinstance(payload.get("market"), dict) else payload
+            settlement_price = self._extract_settlement_price(market)
+            threshold = self._extract_threshold(market)
+        except Exception:
+            settlement_price = None
+            threshold = None
+
+        if settlement_price is None or threshold is None:
+            return {
+                "status": "settlement_pending",
+                "market_ticker": ticker,
+                "filled_contracts": 0,
+            }
+
+        exit_price_cents = 100 if (
+            (position.side == "yes" and settlement_price >= threshold)
+            or (position.side == "no" and settlement_price < threshold)
+        ) else 0
+
+        pnl_cents = int((exit_price_cents - position.entry_price_cents) * position.contracts)
+
+        self._daily_closed_trades.append(
+            ClosedTrade(
+                market_ticker=ticker,
+                strategy_name="daily",
+                closed_at=observed_at,
+                realized_pnl_cents=pnl_cents,
+            )
+        )
+        del self._daily_positions[ticker]
+        self._daily_position_fair_values.pop(ticker, None)
+
+        self._trace_execution_event(
+            {
+                "event": "daily_settled",
+                "market_ticker": ticker,
+                "side": position.side,
+                "settlement_price": settlement_price,
+                "threshold": threshold,
+                "exit_price_cents": exit_price_cents,
+                "pnl_cents": pnl_cents,
+                "contracts": position.contracts,
+            }
+        )
+
+        return {
+            "status": "settled",
+            "market_ticker": ticker,
+            "pnl_cents": pnl_cents,
+            "exit_price_cents": exit_price_cents,
+        }
+
+    def _submit_new_profile_order(
+        self,
+        *,
+        signal: NewSignal,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Submit an order for the NEW profile without REST precheck or blocking fill lookup."""
+        cross_cents = 0 if signal.strategy == "hold_settlement" else 2
+        execution_price_cents = min(signal.entry_price_cents + cross_cents, 99)
+        payload: dict[str, Any] = {
+            "ticker": signal.market_ticker,
+            "action": "buy",
+            "side": signal.side,
+            "count": 1,
+            "type": "limit",
+            "time_in_force": "immediate_or_cancel",
+            "client_order_id": f"kabot-new-{signal.market_ticker}-{int(observed_at.timestamp())}",
+        }
+        if signal.side == "yes":
+            payload["yes_price"] = execution_price_cents
+        else:
+            payload["no_price"] = execution_price_cents
+
+        self._trace_execution_event(
+            {
+                "event": "new_profile_order_submit",
+                "strategy": signal.strategy,
+                "market_ticker": signal.market_ticker,
+                "side": signal.side,
+                "signal_price_cents": signal.entry_price_cents,
+                "execution_price_cents": execution_price_cents,
+                "edge": signal.edge,
+            }
+        )
+
+        if self.config.dry_run:
+            return {
+                "status": "dry_run",
+                "strategy": signal.strategy,
+                "market_ticker": signal.market_ticker,
+                "side": signal.side,
+                "signal_price_cents": signal.entry_price_cents,
+                "execution_price_cents": execution_price_cents,
+                "filled_contracts": 0,
+                "edge": signal.edge,
+                "payload": payload,
+            }
+
+        try:
+            response = self.client.create_order(payload)
+        except Exception as exc:
+            self._trace_execution_event(
+                {
+                    "event": "new_profile_order_error",
+                    "market_ticker": signal.market_ticker,
+                    "error": str(exc),
+                }
+            )
+            return {
+                "status": "error",
+                "market_ticker": signal.market_ticker,
+                "error": str(exc),
+                "filled_contracts": 0,
+            }
+
+        response_order = response.get("order", response) if isinstance(response, dict) else {}
+        order = response_order if isinstance(response_order, dict) else {}
+        order_status = _extract_order_status(order)
+        order_id = _extract_order_id(response)
+        filled_contracts = _extract_fill_count(order)
+
+        if order_id and not (self.fill_feed is not None and self.fill_feed.is_healthy()):
+            try:
+                fills_response = self.client.get_fills(order_id=order_id, ticker=signal.market_ticker)
+                exchange_filled = _filled_contracts_from_fills(fills_response)
+                if exchange_filled is not None:
+                    filled_contracts = exchange_filled
+            except Exception:
+                pass
+
+        self._trace_execution_event(
+            {
+                "event": "new_profile_order_result",
+                "strategy": signal.strategy,
+                "market_ticker": signal.market_ticker,
+                "side": signal.side,
+                "signal_price_cents": signal.entry_price_cents,
+                "execution_price_cents": execution_price_cents,
+                "order_status": order_status,
+                "filled_contracts": filled_contracts,
+                "edge": signal.edge,
+            }
+        )
+
+        return {
+            "status": order_status or "submitted",
+            "strategy": signal.strategy,
+            "market_ticker": signal.market_ticker,
+            "side": signal.side,
+            "signal_price_cents": signal.entry_price_cents,
+            "execution_price_cents": execution_price_cents,
+            "filled_contracts": max(int(filled_contracts), 0),
+            "order_id": order_id,
+            "edge": signal.edge,
+            "response": response,
+        }
 
     def _submit_order(self, candidate: StrategyCandidate) -> dict[str, Any]:
         if self.config.enable_execution_sessions:

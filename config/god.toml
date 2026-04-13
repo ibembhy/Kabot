@@ -1,0 +1,5 @@
+# GOD profile backtest overrides
+# Used with: kabot run-backtest --config config/god.toml
+
+[backtest]
+fee_rate_bps = 70.0
