@@ -29,6 +29,7 @@ from kabot.trading.daily_strategies import (
     DailySignalConfig,
     evaluate_daily_exit,
     evaluate_daily_signal,
+    evaluate_daily_signal_debug,
 )
 from kabot.trading.daily_vol import bootstrap_hourly_vol, estimate_hourly_vol_from_db
 from kabot.trading.execution_state import ExecutionStateStore
@@ -465,13 +466,13 @@ class LiveTraderConfig:
     series_ticker: str = "KXBTC15M"
     daily_vol_floor: float = 0.40
     daily_min_edge: float = 0.06
-    daily_min_price_cents: int = 65
+    daily_min_price_cents: int = 40
     daily_max_price_cents: int = 95
     daily_min_tte_minutes: float = 8.0
     daily_max_tte_minutes: float = 50.0
     daily_min_distance_dollars: float = 200.0
     daily_max_spread_cents: int = 6
-    daily_min_volume: float = 500.0
+    daily_min_volume: float = 0.0
     daily_stop_loss_cents: int = 15
     daily_fair_value_buffer_cents: int = 3
     daily_negative_edge_threshold: float = -0.04
@@ -1002,6 +1003,7 @@ class LiveTrader:
         self._daily_positions: dict[str, Position] = {}
         self._daily_position_fair_values: dict[str, int] = {}
         self._daily_closed_trades: list[ClosedTrade] = []
+        self._last_daily_signal_debug_at: datetime | None = None
         # WebSocket feeds — started in run_forever()
         self.spot_feed = CoinbaseSpotFeed()
         auth_signer = getattr(client, "auth_signer", None)
@@ -3137,6 +3139,34 @@ class LiveTrader:
 
         results: list[dict[str, Any]] = []
         snapshots_by_ticker = {snapshot.market_ticker: snapshot for snapshot in snapshots}
+        if (
+            self._last_daily_signal_debug_at is None
+            or (observed_at - self._last_daily_signal_debug_at).total_seconds() >= 300.0
+        ):
+            self._last_daily_signal_debug_at = observed_at
+            reason_counts: dict[str, int] = {}
+            passed_tickers: list[str] = []
+            for snapshot in snapshots:
+                r = evaluate_daily_signal_debug(
+                    snapshot,
+                    volatility=volatility,
+                    config=signal_config,
+                    observed_at=observed_at,
+                )
+                reason = str(r.get("reason", "unknown"))
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                if not r.get("rejected", True):
+                    passed_tickers.append(snapshot.market_ticker)
+            debug_event = {
+                "event": "daily_signal_debug",
+                "profile": self.config.active_profile,
+                "daily_vol": round(volatility, 4),
+                "result_count": len(snapshots),
+                "reason_counts": {**reason_counts, "passed": len(passed_tickers)},
+                "passed_tickers": passed_tickers,
+            }
+            self._trace_execution_event(debug_event)
+            print(json.dumps(debug_event), flush=True)
 
         for ticker, position in list(self._daily_positions.items()):
             if position.status != "open" or position.contracts <= 0:
@@ -3250,15 +3280,16 @@ class LiveTrader:
             if open_daily_count >= self.config.daily_max_open_markets:
                 break
 
-            signal = evaluate_daily_signal(
+            signal_result = evaluate_daily_signal(
                 snapshot,
                 volatility=volatility,
                 config=signal_config,
                 observed_at=observed_at,
             )
 
-            if signal is None:
+            if isinstance(signal_result, str):
                 continue
+            signal = signal_result
 
             self._trace_execution_event(
                 {
