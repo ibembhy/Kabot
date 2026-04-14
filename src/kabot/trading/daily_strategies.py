@@ -38,14 +38,14 @@ class DailySignal:
 
 @dataclass(frozen=True)
 class DailySignalConfig:
-    min_edge: float = 0.06
-    min_price_cents: int = 65
+    min_edge: float = 0.04
+    min_price_cents: int = 40
     max_price_cents: int = 95
     min_tte_minutes: float = 8.0
     max_tte_minutes: float = 50.0
     min_distance_dollars: float = 200.0
     max_spread_cents: int = 6
-    min_volume: float = 500.0
+    min_volume: float = 0.0
 
 
 def evaluate_daily_signal(
@@ -54,24 +54,24 @@ def evaluate_daily_signal(
     volatility: float,
     config: DailySignalConfig,
     observed_at: datetime,
-) -> DailySignal | None:
-    """Return the best-edge signal if DAILY conditions are met, else None.
+) -> DailySignal | str:
+    """Return the best-edge signal if DAILY conditions are met, else a rejection reason.
 
     Evaluates both YES and NO. Returns the side with the highest edge
     that passes all filters. Never returns the first side found.
     """
     if snapshot.contract_type != "threshold" or snapshot.threshold is None:
-        return None
+        return "not_threshold"
     if (snapshot.volume or 0.0) < config.min_volume:
-        return None
+        return "low_volume"
 
     tte_minutes = max((snapshot.expiry - observed_at).total_seconds() / 60.0, 0.0)
     if not (config.min_tte_minutes < tte_minutes <= config.max_tte_minutes):
-        return None
+        return "tte_out_of_window"
 
     distance = abs(snapshot.spot_price - snapshot.threshold)
     if distance < config.min_distance_dollars:
-        return None
+        return "distance_too_small"
 
     from kabot.trading.daily_vol import DAILY_VOL_FLOOR
 
@@ -79,6 +79,8 @@ def evaluate_daily_signal(
     prob_yes = probability_for_snapshot(snapshot, volatility=sigma, drift=0.0)
 
     best_signal: DailySignal | None = None
+    saw_price_range = False
+    saw_acceptable_spread = False
 
     for side, model_prob, ask, bid in [
         ("yes", prob_yes, snapshot.yes_ask, snapshot.yes_bid),
@@ -92,8 +94,10 @@ def evaluate_daily_signal(
 
         if not (config.min_price_cents <= ask_cents <= config.max_price_cents):
             continue
+        saw_price_range = True
         if spread_cents > config.max_spread_cents:
             continue
+        saw_acceptable_spread = True
 
         edge = model_prob - ask
         if edge < config.min_edge:
@@ -117,7 +121,99 @@ def evaluate_daily_signal(
         if best_signal is None or signal.edge > best_signal.edge:
             best_signal = signal
 
+    if best_signal is None:
+        if not saw_price_range:
+            return "no_side_in_price_range"
+        if not saw_acceptable_spread:
+            return "spread_too_wide"
+        return "edge_too_low"
     return best_signal
+
+
+def evaluate_daily_signal_debug(
+    snapshot: MarketSnapshot,
+    *,
+    volatility: float,
+    config: DailySignalConfig,
+    observed_at: datetime,
+) -> dict[str, object]:
+    """Return DAILY signal gating details for trace/debug logs."""
+    tte_minutes = max((snapshot.expiry - observed_at).total_seconds() / 60.0, 0.0)
+    distance_dollars = (
+        abs(snapshot.spot_price - snapshot.threshold)
+        if snapshot.threshold is not None
+        else 0.0
+    )
+    debug: dict[str, object] = {
+        "market_ticker": snapshot.market_ticker,
+        "rejected": True,
+        "reason": "not_threshold",
+        "tte_minutes": tte_minutes,
+        "distance_dollars": distance_dollars,
+        "best_ask_cents": None,
+        "best_edge": None,
+    }
+
+    if snapshot.contract_type != "threshold" or snapshot.threshold is None:
+        return debug
+    if (snapshot.volume or 0.0) < config.min_volume:
+        debug["reason"] = "low_volume"
+        return debug
+    if not (config.min_tte_minutes < tte_minutes <= config.max_tte_minutes):
+        debug["reason"] = "tte_out_of_window"
+        return debug
+    if distance_dollars < config.min_distance_dollars:
+        debug["reason"] = "distance_too_small"
+        return debug
+
+    from kabot.trading.daily_vol import DAILY_VOL_FLOOR
+
+    sigma = max(volatility, DAILY_VOL_FLOOR)
+    prob_yes = probability_for_snapshot(snapshot, volatility=sigma, drift=0.0)
+
+    saw_price_range = False
+    saw_acceptable_spread = False
+    best_ask_cents: int | None = None
+    best_edge: float | None = None
+
+    for model_prob, ask, bid in [
+        (prob_yes, snapshot.yes_ask, snapshot.yes_bid),
+        (1.0 - prob_yes, snapshot.no_ask, snapshot.no_bid),
+    ]:
+        if ask is None or bid is None:
+            continue
+        ask_cents = int(round(ask * 100.0))
+        bid_cents = int(round(bid * 100.0))
+        edge = model_prob - ask
+        if best_edge is None or edge > best_edge:
+            best_edge = edge
+            best_ask_cents = ask_cents
+        if not (config.min_price_cents <= ask_cents <= config.max_price_cents):
+            continue
+        saw_price_range = True
+        if ask_cents - bid_cents > config.max_spread_cents:
+            continue
+        saw_acceptable_spread = True
+        if edge >= config.min_edge:
+            debug.update(
+                {
+                    "rejected": False,
+                    "reason": "passed",
+                    "best_ask_cents": ask_cents,
+                    "best_edge": edge,
+                }
+            )
+            return debug
+
+    debug["best_ask_cents"] = best_ask_cents
+    debug["best_edge"] = best_edge
+    if not saw_price_range:
+        debug["reason"] = "no_side_in_price_range"
+    elif not saw_acceptable_spread:
+        debug["reason"] = "spread_too_wide"
+    else:
+        debug["reason"] = "edge_too_low"
+    return debug
 
 
 @dataclass(frozen=True)

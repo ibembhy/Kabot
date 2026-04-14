@@ -465,7 +465,7 @@ class LiveTraderConfig:
     active_profile: str = "baseline_live"
     series_ticker: str = "KXBTC15M"
     daily_vol_floor: float = 0.40
-    daily_min_edge: float = 0.06
+    daily_min_edge: float = 0.04
     daily_min_price_cents: int = 40
     daily_max_price_cents: int = 95
     daily_min_tte_minutes: float = 8.0
