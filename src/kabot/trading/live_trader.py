@@ -465,12 +465,12 @@ class LiveTraderConfig:
     active_profile: str = "baseline_live"
     series_ticker: str = "KXBTC15M"
     daily_vol_floor: float = 0.40
-    daily_min_edge: float = 0.04
+    daily_min_edge: float = 0.02
     daily_min_price_cents: int = 40
     daily_max_price_cents: int = 95
     daily_min_tte_minutes: float = 8.0
     daily_max_tte_minutes: float = 50.0
-    daily_min_distance_dollars: float = 200.0
+    daily_min_distance_dollars: float = 100.0
     daily_max_spread_cents: int = 6
     daily_min_volume: float = 0.0
     daily_stop_loss_cents: int = 15
@@ -567,6 +567,10 @@ class LiveTraderConfig:
     whipsaw_max_crossings: int = 999999
     overnight_edge_multiplier: float = 1.0
     overnight_hours_utc: tuple[int, int] = (0, 7)
+    latency_repricing_min_move_bps: float = 3.0
+    latency_repricing_persistence_factor: float = 0.75
+    resting_entry_max_chase_cents: int = 3
+    resting_entry_max_replace_attempts: int = 2
 
 
 @dataclass(frozen=True)
@@ -974,8 +978,8 @@ class LiveTrader:
         self.config = config
         self.model = LatencyRepricingModel(
             volatility_floor=config.gbm_volatility_floor,
-            persistence_factor=0.75,
-            min_move_bps=3.0,
+            persistence_factor=config.latency_repricing_persistence_factor,
+            min_move_bps=config.latency_repricing_min_move_bps,
         )
         self.local_positions: dict[str, Position] = {}
         self.position_strategies: dict[str, str] = {}
@@ -983,6 +987,7 @@ class LiveTrader:
         self.pending_signal_breaks: dict[str, PendingSignalBreakState] = {}
         self.signal_break_blocked_tickers: set[str] = set()
         self.local_resting_entry_locks: dict[str, LocalRestingEntryLock] = {}
+        self._resting_entry_replace_counts: dict[str, int] = {}
         self.failed_entry_attempts: dict[str, int] = {}
         self.failed_entry_blocked_until: dict[str, datetime] = {}
         self.failed_entry_last_attempt: dict[str, datetime] = {}
@@ -1000,8 +1005,10 @@ class LiveTrader:
         self._velocity_detector = BTCVelocityDetector(window_seconds=30.0, min_points=3)
         self._bootstrapped_vol: float | None = None
         self._daily_vol: float | None = None
+        self._daily_vol_last_refresh: datetime | None = None
         self._daily_positions: dict[str, Position] = {}
         self._daily_position_fair_values: dict[str, int] = {}
+        self._daily_pending_orders: dict[str, dict] = {}
         self._daily_closed_trades: list[ClosedTrade] = []
         self._last_daily_signal_debug_at: datetime | None = None
         # WebSocket feeds — started in run_forever()
@@ -1380,6 +1387,26 @@ class LiveTrader:
             market_probability = candidate.price_cents / 100.0
             side_probability = estimate.probability if candidate.side == "yes" else (1.0 - estimate.probability)
             edge = side_probability - market_probability
+            if estimate.inputs.get("blend_weight", 0.0) > 0:
+                self._trace_execution_event({
+                    "event": "latency_repricing_fired",
+                    "profile": self.config.active_profile,
+                    "market_ticker": candidate.snapshot.market_ticker,
+                    "recent_move_bps": estimate.inputs.get("recent_move_bps"),
+                    "base_probability": estimate.inputs.get("base_probability"),
+                    "repriced_probability": estimate.inputs.get("repriced_probability"),
+                    "blended_probability": round(estimate.probability, 6),
+                    "blend_weight": estimate.inputs.get("blend_weight"),
+                    "effective_spot": estimate.inputs.get("effective_spot"),
+                    "side": candidate.side,
+                    "market_price_cents": candidate.price_cents,
+                    "edge_before_repricing": round(
+                        (estimate.inputs.get("base_probability", 0.0) if candidate.side == "yes"
+                         else 1.0 - estimate.inputs.get("base_probability", 0.0))
+                        - candidate.price_cents / 100.0, 4
+                    ),
+                    "edge_after_repricing": round(edge, 4),
+                })
             min_edge = self._required_gbm_edge(
                 strategy_name=candidate.strategy_name,
                 ask_cents=candidate.price_cents,
@@ -1454,6 +1481,7 @@ class LiveTrader:
             filled_contracts = max(int(order.get("filled_contracts", 0) or 0), 0)
             if filled_contracts > 0:
                 self._clear_failed_entry_attempts(candidate.snapshot.market_ticker)
+                self._resting_entry_replace_counts.pop(candidate.snapshot.market_ticker, None)
                 self.local_resting_entry_locks.pop(candidate.snapshot.market_ticker, None)
                 self._register_successful_reentry(candidate)
                 self._trace_execution_event(
@@ -1633,6 +1661,7 @@ class LiveTrader:
                 self.reentry_states.pop(ticker, None)
                 self.pending_signal_breaks.pop(ticker, None)
                 self.signal_break_blocked_tickers.discard(ticker)
+                self._resting_entry_replace_counts.pop(ticker, None)
                 self.local_resting_entry_locks.pop(ticker, None)
                 self.failed_entry_attempts.pop(ticker, None)
                 self.failed_entry_blocked_until.pop(ticker, None)
@@ -1786,7 +1815,18 @@ class LiveTrader:
                 if spread_cents >= int(self.config.execution_spread_wide_cents):
                     max_age = min(max_age, float(self.config.resting_entry_max_age_seconds_low_depth))
             if cancel_reason is None and max_age > 0 and age_seconds > max_age:
-                cancel_reason = "time_cutoff_cancel"
+                # Change 2: skip time cutoff if our order is still competitive (at or above best bid)
+                if lock.price_cents is not None and bid_cents is not None and lock.price_cents >= bid_cents:
+                    self._trace_execution_event({
+                        "event": "resting_entry_still_competitive",
+                        "market_ticker": ticker,
+                        "price_cents": lock.price_cents,
+                        "best_bid_cents": bid_cents,
+                        "age_seconds": age_seconds,
+                    })
+                    lock.created_at = observed_at
+                else:
+                    cancel_reason = "time_cutoff_cancel"
             dist = self.config.distance_threshold_dollars
             # Signal broken: spot no longer satisfies direction requirement
             if cancel_reason is None:
@@ -1806,6 +1846,73 @@ class LiveTrader:
                     if cancel_reason is None and lock.gbm_edge is not None and edge <= (lock.gbm_edge - float(self.config.edge_decay_cancel_threshold)):
                         cancel_reason = "edge_decay_cancel"
             if cancel_reason is None:
+                continue
+            # Change 1: attempt order replacement before canceling on time_cutoff_cancel only
+            replaced = False
+            if cancel_reason == "time_cutoff_cancel":
+                replace_count = self._resting_entry_replace_counts.get(ticker, 0)
+                if replace_count < int(self.config.resting_entry_max_replace_attempts):
+                    if (
+                        lock.price_cents is not None
+                        and bid_cents is not None
+                        and volatility is not None
+                    ):
+                        new_price_cents = bid_cents + 1
+                        if new_price_cents - lock.price_cents <= int(self.config.resting_entry_max_chase_cents):
+                            chase_estimate = self.model.estimate(snapshot, volatility=volatility)
+                            chase_side_prob = chase_estimate.probability if lock.side == "yes" else (1.0 - chase_estimate.probability)
+                            residual_edge = chase_side_prob - new_price_cents / 100.0
+                            if residual_edge > 0:
+                                replace_order_id: str | None = None
+                                if self.fill_feed is not None:
+                                    replace_order_id = self.fill_feed.get_resting_order_id(ticker)
+                                if not replace_order_id:
+                                    try:
+                                        orders_payload = self.client.list_orders(status="resting")
+                                        for order in _extract_orders(orders_payload):
+                                            if _extract_market_ticker(order) == ticker and str(order.get("action", "")).lower() == "buy":
+                                                replace_order_id = _extract_order_id({"order": order})
+                                                break
+                                    except Exception:
+                                        pass
+                                try:
+                                    if replace_order_id:
+                                        self.client.cancel_order(replace_order_id)
+                                        if self.fill_feed is not None:
+                                            self.fill_feed.deregister_order(ticker)
+                                    replace_payload: dict[str, Any] = {
+                                        "ticker": ticker,
+                                        "action": "buy",
+                                        "side": lock.side,
+                                        "count": lock.contracts or 1,
+                                        "type": "limit",
+                                        "time_in_force": "good_till_canceled",
+                                    }
+                                    if lock.side == "yes":
+                                        replace_payload["yes_price"] = new_price_cents
+                                    else:
+                                        replace_payload["no_price"] = new_price_cents
+                                    replace_response = self.client.create_order(replace_payload)
+                                    new_order_id = _extract_order_id(replace_response)
+                                    if new_order_id and self.fill_feed is not None:
+                                        self.fill_feed.register_order(ticker, new_order_id)
+                                    new_replace_count = replace_count + 1
+                                    self._resting_entry_replace_counts[ticker] = new_replace_count
+                                    self._trace_execution_event({
+                                        "event": "resting_entry_replaced",
+                                        "market_ticker": ticker,
+                                        "order_id": new_order_id,
+                                        "old_price_cents": lock.price_cents,
+                                        "new_price_cents": new_price_cents,
+                                        "replace_count": new_replace_count,
+                                        "reason": "market_moved_away",
+                                    })
+                                    lock.price_cents = new_price_cents
+                                    lock.created_at = datetime.now(UTC)
+                                    replaced = True
+                                except Exception:
+                                    pass
+            if replaced:
                 continue
             # Resolve order_id: fill_feed first, then REST
             order_id: str | None = None
@@ -1833,6 +1940,7 @@ class LiveTrader:
                     pass
             if self.fill_feed is not None:
                 self.fill_feed.deregister_order(ticker)
+            self._resting_entry_replace_counts.pop(ticker, None)
             self.local_resting_entry_locks.pop(ticker, None)
 
     def _record_failed_entry_attempt(
@@ -2428,13 +2536,10 @@ class LiveTrader:
             self._daily_vol = self.config.daily_vol_floor
             print(f"[DAILY] Vol bootstrap failed, using floor: {self._daily_vol:.4f}", flush=True)
             return
-        result = bootstrap_hourly_vol(
-            session,
-            floor=self.config.daily_vol_floor,
-        )
-        if result is not None:
-            self._daily_vol = result
-            print(f"[DAILY] Bootstrapped vol: {self._daily_vol:.4f}", flush=True)
+        raw = bootstrap_hourly_vol(session, floor=0.0)
+        if raw is not None:
+            self._daily_vol = max(raw, self.config.daily_vol_floor)
+            print(f"[DAILY] Bootstrapped vol: {self._daily_vol:.4f} (raw={raw:.4f})", flush=True)
         else:
             self._daily_vol = self.config.daily_vol_floor
             print(f"[DAILY] Vol bootstrap failed, using floor: {self._daily_vol:.4f}", flush=True)
@@ -2550,11 +2655,13 @@ class LiveTrader:
             account_contracts = int(account_position_contracts.get(market_ticker, 0))
             if account_contracts > 0:
                 position.contracts = account_contracts
+                self._resting_entry_replace_counts.pop(market_ticker, None)
                 self.local_resting_entry_locks.pop(market_ticker, None)
                 continue
             if market_ticker not in resting_order_tickers:
                 del self.local_positions[market_ticker]
                 self.position_strategies.pop(market_ticker, None)
+                self._resting_entry_replace_counts.pop(market_ticker, None)
                 self.local_resting_entry_locks.pop(market_ticker, None)
         # Promote resting-entry locks into local positions once the account shows fills.
         for market_ticker, contracts in account_position_contracts.items():
@@ -2574,6 +2681,7 @@ class LiveTrader:
                 entry_price_cents=int(lock.price_cents),
             )
             self.position_strategies[market_ticker] = lock.strategy_name
+            self._resting_entry_replace_counts.pop(market_ticker, None)
             self.local_resting_entry_locks.pop(market_ticker, None)
             fill_age_seconds = (observed_at - lock.created_at).total_seconds()
             if fill_age_seconds < 5:
@@ -2644,6 +2752,7 @@ class LiveTrader:
                 "strategy_name": candidate.strategy_name,
                 "signal_price_cents": candidate.price_cents,
                 "contracts": candidate.contracts,
+                "gbm_edge": candidate.gbm_edge,
             }
         )
         for attempt_index in range(max_attempts):
@@ -3117,6 +3226,12 @@ class LiveTrader:
         observed_at: datetime,
     ) -> list[dict[str, Any]]:
         """DAILY profile: evaluate KXBTCD signals and manage open positions."""
+        if (
+            self._daily_vol_last_refresh is None
+            or (observed_at - self._daily_vol_last_refresh).total_seconds() > 1800
+        ):
+            self._bootstrap_daily_vol()
+            self._daily_vol_last_refresh = observed_at
         volatility = self._estimate_daily_vol(observed_at=observed_at)
 
         signal_config = DailySignalConfig(
@@ -3167,6 +3282,8 @@ class LiveTrader:
             }
             self._trace_execution_event(debug_event)
             print(json.dumps(debug_event), flush=True)
+
+        self._reconcile_daily_pending_orders(observed_at)
 
         for ticker, position in list(self._daily_positions.items()):
             if position.status != "open" or position.contracts <= 0:
@@ -3310,6 +3427,7 @@ class LiveTrader:
             order_result = self._submit_daily_entry_order(
                 signal=signal,
                 observed_at=observed_at,
+                expiry=snapshot.expiry,
             )
             results.append(order_result)
 
@@ -3565,11 +3683,52 @@ class LiveTrader:
             return "edge_below_b"
         return "unknown_b"
 
+    def _reconcile_daily_pending_orders(self, observed_at: datetime) -> None:
+        """Promote any GTC DAILY orders that filled after submission into _daily_positions."""
+        for order_id in list(self._daily_pending_orders):
+            pending = self._daily_pending_orders[order_id]
+            market_ticker = pending["market_ticker"]
+            if market_ticker in self._daily_positions:
+                del self._daily_pending_orders[order_id]
+                continue
+            try:
+                response = self.client.get_order(order_id)
+            except Exception:
+                continue
+            order = response.get("order", response) if isinstance(response, dict) else {}
+            if not isinstance(order, dict):
+                order = {}
+            filled = _extract_fill_count(order)
+            if filled <= 0:
+                continue
+            self._daily_positions[market_ticker] = Position(
+                position_id=str(uuid4()),
+                market_ticker=market_ticker,
+                side=pending["side"],
+                contracts=filled,
+                entry_time=observed_at,
+                entry_price_cents=pending["entry_price_cents"],
+                expiry=pending.get("expiry"),
+            )
+            self._daily_position_fair_values[market_ticker] = pending["fair_value_cents"]
+            del self._daily_pending_orders[order_id]
+            self._trace_execution_event(
+                {
+                    "event": "daily_entry_promoted_from_pending",
+                    "order_id": order_id,
+                    "market_ticker": market_ticker,
+                    "side": pending["side"],
+                    "filled_contracts": filled,
+                    "entry_price_cents": pending["entry_price_cents"],
+                }
+            )
+
     def _submit_daily_entry_order(
         self,
         *,
         signal: DailySignal,
         observed_at: datetime,
+        expiry: datetime | None = None,
     ) -> dict[str, Any]:
         """Submit a GTC limit entry order for the DAILY profile."""
         payload: dict[str, Any] = {
@@ -3636,6 +3795,16 @@ class LiveTrader:
         if order_id and self.fill_feed is not None:
             self.fill_feed.register_order(signal.market_ticker, order_id)
 
+        if order_id:
+            self._daily_pending_orders[order_id] = {
+                "market_ticker": signal.market_ticker,
+                "side": signal.side,
+                "entry_price_cents": signal.entry_price_cents,
+                "fair_value_cents": signal.fair_value_cents,
+                "expiry": expiry,
+                "contracts_requested": self.config.daily_contracts_per_trade,
+            }
+
         return {
             "status": order_status or "submitted",
             "market_ticker": signal.market_ticker,
@@ -3682,6 +3851,17 @@ class LiveTrader:
             payload["yes_price"] = exit_price_cents
         else:
             payload["no_price"] = exit_price_cents
+
+        self._trace_execution_event(
+            {
+                "event": "daily_exit_submitted",
+                "market_ticker": position.market_ticker,
+                "side": position.side,
+                "exit_price_cents": exit_price_cents,
+                "contracts": position.contracts,
+                "reason": reason,
+            }
+        )
 
         if self.config.dry_run:
             return {

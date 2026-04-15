@@ -537,7 +537,7 @@ def test_god_rejects_impossible_edge_before_order_submit(tmp_path) -> None:
 
     class _CertainModel:
         def estimate(self, snapshot, *, volatility):
-            return type("Estimate", (), {"probability": 1.0})()
+            return type("Estimate", (), {"probability": 1.0, "inputs": {}})()
 
     observed_at = datetime.now(UTC)
     trace_path = tmp_path / "execution_trace.jsonl"
@@ -1060,11 +1060,12 @@ def test_cancel_resting_entry_on_max_age() -> None:
         ),
     )
     observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    # Lock placed at 38 cents; market bid has since moved to 44 (above our price → not competitive)
     trader.local_resting_entry_locks["OPEN-NO"] = LocalRestingEntryLock(
         created_at=observed_at - timedelta(seconds=45),
         side="no",
         strategy_name="no_continuation_mid",
-        price_cents=50,
+        price_cents=38,
         gbm_edge=0.03,
         observed_at=observed_at - timedelta(seconds=45),
     )
@@ -1122,11 +1123,12 @@ def test_hybrid_resting_entry_cancels_on_short_ioc_max_age() -> None:
         ),
     )
     observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    # Lock placed at 38 cents; market bid has moved to 44 (above our price → not competitive)
     trader.local_resting_entry_locks["OPEN-NO"] = LocalRestingEntryLock(
         created_at=observed_at - timedelta(seconds=6),
         side="no",
         strategy_name="no_continuation_mid",
-        price_cents=50,
+        price_cents=38,
         gbm_edge=0.03,
         observed_at=observed_at - timedelta(seconds=6),
     )
@@ -1939,3 +1941,169 @@ def test_submit_order_ioc_stops_retrying_if_setup_breaks(monkeypatch) -> None:
 
     assert len(client.create_payloads) == 1
     assert result["status"] == "ioc_not_retried"
+
+
+def test_resting_entry_replaced_when_time_cutoff_and_still_has_edge() -> None:
+    """When time_cutoff fires but bid has moved above our price, replace at bid+1 if edge holds."""
+
+    class _ReplaceClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.canceled: list[str] = []
+
+        def cancel_order(self, order_id: str) -> dict:
+            self.canceled.append(order_id)
+            return {"order_id": order_id, "status": "canceled"}
+
+        def list_orders(self, status: str | None = None, **_kwargs) -> dict:
+            return {"orders": [{"order_id": "rest-old", "ticker": "OPEN-YES", "action": "buy"}]}
+
+        def create_order(self, payload: dict) -> dict:
+            self.created += 1
+            self.create_payloads.append(payload)
+            return {"order": {"order_id": f"replace-{self.created}", "status": "resting"}}
+
+    class _HighProbModel:
+        def estimate(self, snapshot, *, volatility):
+            return type("E", (), {"probability": 0.70, "inputs": {}})()
+
+    client = _ReplaceClient()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            entry_time_in_force="good_till_canceled",
+            resting_entry_max_age_seconds=30.0,
+            resting_entry_max_age_seconds_high=90.0,
+            high_conviction_edge_threshold=0.15,
+            high_conviction_distance_threshold_dollars=8.0,
+            distance_threshold_dollars=7.0,
+            gbm_min_points=3,
+            resting_entry_max_chase_cents=3,
+            resting_entry_max_replace_attempts=2,
+        ),
+    )
+    trader.model = _HighProbModel()  # type: ignore[assignment]
+
+    observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    # Lock price is 50; market bid has moved to 52 (we're now behind the queue)
+    trader.local_resting_entry_locks["OPEN-YES"] = LocalRestingEntryLock(
+        created_at=observed_at - timedelta(seconds=45),
+        side="yes",
+        strategy_name="yes_continuation_mid",
+        price_cents=50,
+        gbm_edge=0.08,
+        observed_at=observed_at - timedelta(seconds=45),
+        contracts=2,
+    )
+    snapshot = MarketSnapshot(
+        source="test",
+        series_ticker="KXBTC15M",
+        market_ticker="OPEN-YES",
+        contract_type="threshold",
+        underlying_symbol="BTC-USD",
+        observed_at=observed_at,
+        expiry=observed_at + timedelta(minutes=6),
+        # Signal still intact: spot is well above threshold+dist (68010 > 68000+7 is false, use yes side)
+        spot_price=68020.0,
+        threshold=68000.0,
+        # Best bid at 52 — above our resting price of 50, so we're not competitive
+        yes_bid=0.52,
+        yes_ask=0.53,
+        no_bid=0.47,
+        no_ask=0.48,
+        volume=10000.0,
+    )
+
+    trader._cancel_stale_resting_entry_orders(
+        observed_at=observed_at,
+        snapshots=[snapshot],
+        volatility=0.3,
+    )
+
+    # Lock should still be held — order was replaced, not canceled
+    assert "OPEN-YES" in trader.local_resting_entry_locks
+    lock = trader.local_resting_entry_locks["OPEN-YES"]
+    # New price should be best_bid + 1 = 52 + 1 = 53
+    assert lock.price_cents == 53
+    # Replace count incremented
+    assert trader._resting_entry_replace_counts.get("OPEN-YES") == 1
+    # Old order was canceled and new order was submitted
+    assert "rest-old" in client.canceled
+    assert len(client.create_payloads) == 1
+    new_payload = client.create_payloads[0]
+    assert new_payload["yes_price"] == 53
+    assert new_payload["time_in_force"] == "good_till_canceled"
+
+
+def test_resting_entry_not_replaced_when_signal_break() -> None:
+    """signal_break_cancel should cancel immediately without any replacement attempt."""
+
+    class _CancelOnlyClient(_StubClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.canceled: list[str] = []
+
+        def cancel_order(self, order_id: str) -> dict:
+            self.canceled.append(order_id)
+            return {"order_id": order_id, "status": "canceled"}
+
+        def list_orders(self, status: str | None = None, **_kwargs) -> dict:
+            return {"orders": [{"order_id": "rest-break", "ticker": "OPEN-YES", "action": "buy"}]}
+
+    client = _CancelOnlyClient()
+    trader = LiveTrader(
+        store=_StubStore(),
+        client=client,  # type: ignore[arg-type]
+        config=LiveTraderConfig(
+            entry_time_in_force="good_till_canceled",
+            resting_entry_max_age_seconds=30.0,
+            distance_threshold_dollars=7.0,
+            gbm_min_points=3,
+            resting_entry_max_chase_cents=3,
+            resting_entry_max_replace_attempts=2,
+        ),
+    )
+
+    observed_at = datetime(2026, 4, 6, 12, 0, tzinfo=UTC)
+    trader.local_resting_entry_locks["OPEN-YES"] = LocalRestingEntryLock(
+        created_at=observed_at - timedelta(seconds=5),
+        side="yes",
+        strategy_name="yes_continuation_mid",
+        price_cents=50,
+        gbm_edge=0.08,
+        observed_at=observed_at - timedelta(seconds=5),
+        contracts=2,
+    )
+    snapshot = MarketSnapshot(
+        source="test",
+        series_ticker="KXBTC15M",
+        market_ticker="OPEN-YES",
+        contract_type="threshold",
+        underlying_symbol="BTC-USD",
+        observed_at=observed_at,
+        expiry=observed_at + timedelta(minutes=6),
+        # Signal broken: spot has dropped below threshold+dist for yes side
+        spot_price=67900.0,
+        threshold=68000.0,
+        yes_bid=0.35,
+        yes_ask=0.36,
+        no_bid=0.64,
+        no_ask=0.65,
+        volume=10000.0,
+    )
+
+    trader._cancel_stale_resting_entry_orders(
+        observed_at=observed_at,
+        snapshots=[snapshot],
+        volatility=None,  # no vol so only signal_break check fires
+    )
+
+    # Lock removed — signal break always cancels
+    assert "OPEN-YES" not in trader.local_resting_entry_locks
+    # No replacement submitted
+    assert len(client.create_payloads) == 0
+    # Original order was canceled
+    assert client.canceled == ["rest-break"]
+    # Replace count cleared
+    assert trader._resting_entry_replace_counts.get("OPEN-YES") is None
